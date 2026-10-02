@@ -166,8 +166,10 @@ Auth precedence (see `src/scripts/common.ts`): `REACT_APP_DHIS2_TOKEN_PROD` >
 
 ```
 $ yarn extract-forms --country KEN --discover      # preflight: what exists, no extraction
-$ yarn extract-forms --dry-run                     # resolve form names -> UIDs only
-$ yarn extract-forms --country KEN                 # extract everything for one country
+$ yarn extract-forms --dry-run                     # resolve forms -> program UIDs only
+$ yarn extract-forms --country KEN                 # one workbook for one country
+$ yarn extract-forms --per-country                 # one workbook per country that has data
+$ yarn extract-forms                               # everything the user can read, one workbook
 $ yarn extract-forms --country KEN --start-date 2024-01-01 --end-date 2024-12-31
 ```
 
@@ -178,8 +180,71 @@ a full workbook forecast (worksheet count, total cells, an estimated file size r
 warnings for unusually wide/large sheets), and the planned scope, then exits without writing
 anything. The forecast mirrors extraction's own skip rule exactly (a form or stage proven to
 have 0 records produces no sheet), so the sheet list `--discover` prints is the sheet list a
-real run will produce — not a superset of it. Ward Summary Statistics is an aggregate dataSet
-and needs `--start-date` / `--end-date` to be extracted.
+real run will produce — not a superset of it.
+
+The two ward statistics dataSets (`WardSummaryStats`: ward x specialty; `WardLevelStats`:
+ward only) are aggregate data. `--start-date` / `--end-date` apply to them only and default
+to all periods (2000-01-01 to today); without `--country` / `--org-unit` they are read under
+the user's own root org units. The two share their data elements, so DHIS2 returns each
+one's values for both; every value is written once, on the sheet of the dataSet that owns
+its ward combo, and `_index` says how many were left to the other sheet.
+
+##### Default and custom programs
+
+A form is identified by its **default** program. A survey can use a custom variant instead
+(datastore `amr-surveys/modules` → `customForms`), so a country's data sits in whichever of
+the default and custom programs it used. For each form the script probes the default program
+and every custom variant under the requested scope, extracts those with data, and stacks
+them into **one sheet per form** with a `program` column saying which program each row came
+from. Columns are the union (the programs share almost all their data elements). The
+`_index` sheet lists every program behind each sheet, and reconciliation compares the sheet
+to the summed discovered counts.
+
+`--per-country` takes the countries from the Survey records and writes one workbook per
+country into `extracts/` (or the directory given by `--output`), then prints which programs
+each country used. It cannot be combined with `--country` / `--org-unit`.
+
+##### What the cells contain
+
+- Option-set fields are written as the option **name** (the stored code if the option is unknown).
+- Numeric and date fields, and the `created_at`/`updated_at`/... timestamps, are real Excel
+  numbers and dates; everything else (including UIDs and codes) is text. Numbers longer than
+  Excel's 15 significant digits stay text so they are never rounded.
+- **Fields no longer on the form.** DHIS2 keeps values entered in fields later removed from
+  a form (thousands of antibiotic-history values on the Kyrgyz case reports, for example).
+  The app no longer shows them; the extract keeps them, after their stage's columns, headed
+  with the field's full DHIS2 name (which carries its slot, e.g. `Route1.1YES`) and marked
+  `[not on current form]`. `_index` lists them with their value counts.
+- Single-entry stages that had more than one event with data (the last event's values win),
+  skipped events and fields deleted from DHIS2 metadata are listed on `_index`.
+
+##### Flagged records
+
+Columns A-B of every sheet, `flag` and `flag_detail`, say why a record needs a second look;
+flagged rows are also shaded orange, and every header has a filter. `_index` counts them
+per sheet and explains each flag:
+
+| Flag | Meaning |
+| ---- | ------- |
+| `TEST/INVALID` | Its Survey_id is missing or is not a survey in DHIS2 ("test", "TEST SURVEY ID"...) |
+| `PARENT DELETED` | The case report (or survey) it belongs to was deleted in DHIS2; this record was not |
+| `PARENT MISSING` | The record it belongs to does not exist in DHIS2, or no link was recorded |
+| `OUTSIDE EXTRACT` | The record it belongs to exists, but under another org unit |
+| `SURVEY MISMATCH` | Its own Survey_id differs from its parent's |
+| `PARENT FLAGGED` | The record it belongs to is itself flagged (flags pass down to children) |
+
+Deleted and missing parents are told apart by looking the dangling ids up in DHIS2,
+deleted records included. Flagging never removes a record.
+
+##### Speed and load
+
+A country takes about a minute (Kyrgyzstan, the largest: ~23,000 records, ~60 s end to end).
+With discovery's record counts, all of a program's pages are requested at once; one shared
+cap (`REQUEST_CONCURRENCY`, 4) bounds the full-page requests in flight across the whole run,
+so the load on DHIS2 stays the same however pages and programs overlap. The workbook is
+streamed to disk (`<name>.xlsx.partial`, renamed when complete, so an interrupted run never
+leaves a file that looks finished). `--per-country` carries on past a failed country and
+exits non-zero at the end, naming it.
 
 ##### Relationship specification
 
@@ -199,7 +264,8 @@ same table at runtime for downstream tools.
 | `DischargeClinical` | CaseReport | `CaseReport_id` (`oT6f0BG74xs`) | idem | CaseReport 1→0..N |
 | `DischargeEconomic` | CaseReport | `CaseReport_id` (`HkBG3DVELBM`) | idem | CaseReport 1→0..N |
 | `CohortEnrolment` | CaseReport | `CaseReport_id` (`mGYxog3at84`) | idem | CaseReport 1→0..N |
-| `WardSummaryStats` | (none) | — | `org_unit_id`, `ward_form_id` | aggregate |
+| `WardSummaryStats` | (none) | — | `org_unit_id`, `Ward` | aggregate |
+| `WardLevelStats` | (none) | — | `org_unit_id`, `Ward` | aggregate |
 
 **Case report links to Survey, not Facility.** This is not obvious from the UI's visual
 nesting, but it is what the app filters on: `GetPaginatedSurveysUseCase.ts` uses

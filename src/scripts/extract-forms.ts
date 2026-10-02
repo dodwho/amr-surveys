@@ -8,9 +8,19 @@
  * (amr-surveys/modules) and therefore do not exist as constants in this repo.
  * The constants in data/entities/D2Survey.ts are used only as a cross-check.
  *
+ * A form is defined by its DEFAULT program. A survey may swap in a custom variant (datastore
+ * amr-surveys/modules .customForms), so a country's data lives in whichever of the default
+ * and custom programs it used. Every candidate program is probed under the requested scope;
+ * those with data are extracted and stacked into one sheet per form (see mergeByFormKey).
+ *
  * Usage:
  *   yarn extract-forms --dry-run
- *   yarn extract-forms --org-unit <uid> --start-date 2024-01-01 --end-date 2024-12-31
+ *   yarn extract-forms --country KEN                 one workbook for one country
+ *   yarn extract-forms --per-country                 one workbook per country that has data
+ *   yarn extract-forms                               everything the user can read, one workbook
+ *   yarn extract-forms --country KEN --start-date 2024-01-01 --end-date 2024-12-31
+ *
+ * --start-date/--end-date only affect the Ward Summary Statistics dataSet (default: all time).
  */
 import { command, run, string, boolean, flag, option, optional, number } from "cmd-ts";
 import Excel from "exceljs";
@@ -29,7 +39,6 @@ import {
     type SessionManager,
 } from "./common";
 import { AMRSurveyModule } from "../domain/entities/AMRSurveyModule";
-import { getDefaultProgram } from "../data/utils/getDefaultProgram";
 import { getParentDataElementForProgram } from "../data/utils/surveyProgramHelper";
 import {
     AMR_SURVEYS_MORTALITY_TEA_SURVEY_ID_COH,
@@ -55,6 +64,7 @@ import {
     PREVALENCE_SUPRANATIONAL_REF_LAB_ID,
     PREVALENCE_SURVEY_FORM_ID,
     PREVALENCE_SURVEY_NAME_DATAELEMENT_ID,
+    WARD_STATISTICS_WARD_LEVEL_FORM_ID,
     WARD_SUMMARY_STATISTICS_FORM_ID,
 } from "../data/entities/D2Survey";
 
@@ -68,10 +78,13 @@ type FormKind = "tracker" | "event" | "dataSet" | "trackerStage";
 type FormSpec = {
     /** Short stable key; used as the Excel sheet name and in the FK columns. */
     key: string;
-    /** Name as it appears on the DHIS2 server. Resolution is by this name. */
+    /** Name as it appears on the DHIS2 server. Display only; resolution is by UID. */
     requestedName: string;
-    /** Default UID from D2Survey.ts, used only to cross-check the resolution. */
-    expectedDefaultUid?: string;
+    /**
+     * UID of the default program (or dataSet) from D2Survey.ts. The form is identified by
+     * this; its custom variants are read from the datastore (see candidateProgramIds).
+     */
+    defaultUid: string;
     /** Key of the parent form in this registry, if any. */
     parentKey?: string;
     /** Forced kind; otherwise derived from server metadata. */
@@ -79,87 +92,94 @@ type FormSpec = {
 };
 
 const FORMS: FormSpec[] = [
-    { key: "Survey", requestedName: "Survey form", expectedDefaultUid: PREVALENCE_SURVEY_FORM_ID },
+    { key: "Survey", requestedName: "Survey form", defaultUid: PREVALENCE_SURVEY_FORM_ID },
     {
         key: "Facility",
         requestedName: "Facility-level form",
-        expectedDefaultUid: PREVALENCE_FACILITY_LEVEL_FORM_ID,
+        defaultUid: PREVALENCE_FACILITY_LEVEL_FORM_ID,
         parentKey: "Survey",
     },
     {
         // Parent is Survey, NOT Facility — see the note on PARENT_BY_DEFAULT_UID.
         key: "CaseReport",
         requestedName: "Case report form - custom v1",
-        expectedDefaultUid: PREVALENCE_CASE_REPORT_FORM_ID,
+        defaultUid: PREVALENCE_CASE_REPORT_FORM_ID,
         parentKey: "Survey",
     },
     {
         key: "SampleShipment",
         requestedName: "Sample shipment and tracking form - custom v1",
-        expectedDefaultUid: PREVALENCE_SAMPLE_SHIP_TRACK_FORM_ID,
+        defaultUid: PREVALENCE_SAMPLE_SHIP_TRACK_FORM_ID,
         parentKey: "CaseReport",
     },
     {
         key: "CentralRefLab",
         requestedName: "Central reference laboratory ID/AST results form",
-        expectedDefaultUid: PREVALENCE_CENTRAL_REF_LAB_FORM_ID,
+        defaultUid: PREVALENCE_CENTRAL_REF_LAB_FORM_ID,
         parentKey: "CaseReport",
     },
     {
         key: "PathogenIsolates",
         requestedName: "Pathogen Isolates storage and tracking log",
-        expectedDefaultUid: PREVALENCE_PATHOGEN_ISO_STORE_TRACK_ID,
+        defaultUid: PREVALENCE_PATHOGEN_ISO_STORE_TRACK_ID,
         parentKey: "CaseReport",
     },
     {
         key: "Supranational",
         requestedName: "Supranational Reference Laboratory ID/AST results form",
-        expectedDefaultUid: PREVALENCE_SUPRANATIONAL_REF_LAB_ID,
+        defaultUid: PREVALENCE_SUPRANATIONAL_REF_LAB_ID,
         parentKey: "CaseReport",
     },
     {
         key: "FollowUpD28",
         requestedName: "Follow-up form D28 - custom v1",
-        expectedDefaultUid: PREVALENCE_MORTALITY_FOLLOWUP_FORM,
+        defaultUid: PREVALENCE_MORTALITY_FOLLOWUP_FORM,
         parentKey: "CaseReport",
     },
-    // No default UID in the codebase: resolved purely by name, and its parent
-    // link field is derived via the datastore reverse-map at runtime.
-    { key: "Discharge", requestedName: "Discharge form", parentKey: "CaseReport" },
     {
         key: "DischargeClinical",
         requestedName: "Discharge form - Clinical Evaluation",
-        expectedDefaultUid: PREVALENCE_MORTALITY_DISCHARGE_CLINICAL_FORM,
+        defaultUid: PREVALENCE_MORTALITY_DISCHARGE_CLINICAL_FORM,
         parentKey: "CaseReport",
     },
     {
         key: "DischargeEconomic",
         requestedName: "Discharge form - Economical Evaluation",
-        expectedDefaultUid: PREVALENCE_MORTALITY_DISCHARGE_ECONOMIC_FORM,
+        defaultUid: PREVALENCE_MORTALITY_DISCHARGE_ECONOMIC_FORM,
         parentKey: "CaseReport",
     },
     {
         key: "CohortEnrolment",
         requestedName: "Cohort 3 enrolment form - custom v1",
-        expectedDefaultUid: PREVALENCE_MORTALITY_COHORT_ENORL_FORM,
+        defaultUid: PREVALENCE_MORTALITY_COHORT_ENORL_FORM,
         parentKey: "CaseReport",
     },
     {
+        // Ward x specialty. Its successor below holds ward-level values; both are live.
         key: "WardSummaryStats",
         requestedName: "Ward Summary Statistics",
-        expectedDefaultUid: WARD_SUMMARY_STATISTICS_FORM_ID,
+        defaultUid: WARD_SUMMARY_STATISTICS_FORM_ID,
+        kind: "dataSet",
+    },
+    {
+        key: "WardLevelStats",
+        requestedName: "Ward Statistics for Ward",
+        defaultUid: WARD_STATISTICS_WARD_LEVEL_FORM_ID,
         kind: "dataSet",
     },
 ];
 
 // --- Types --------------------------------------------------------------------
 
+/**
+ * ONE program (or dataSet) backing a form. A form with a custom variant resolves to several
+ * of these sharing a `key`: the default program plus each custom program.
+ */
 export type ResolvedForm = FormSpec & {
     uid: string;
     serverName: string;
     kind: FormKind;
-    /** UID of the default form this one overrides (equals uid when not custom). */
-    defaultUid: string;
+    /** True when `uid` is a custom variant of the default program, not the default itself. */
     isCustom: boolean;
     /** Attribute/data element UID on this form holding the parent's id. */
     parentLinkField: string;
@@ -179,6 +199,31 @@ export type Record_ = {
     label: string;
     values: Map<string, string>;
     meta: Map<string, string>;
+    /** Data-quality flags, shown first on the row so epidemiologists see them (see flagRecords). */
+    flags: RecordFlag[];
+};
+
+export type FlagKind =
+    | "TEST/INVALID"
+    | "PARENT DELETED"
+    | "PARENT MISSING"
+    | "OUTSIDE EXTRACT"
+    | "SURVEY MISMATCH"
+    | "PARENT FLAGGED";
+
+export type RecordFlag = { flag: FlagKind; detail: string };
+
+/** What each flag means, for the _index legend. */
+export const FLAG_MEANINGS: Record<FlagKind, string> = {
+    "TEST/INVALID":
+        "The record's Survey_id is missing or is not a survey in DHIS2: almost always test data.",
+    "PARENT DELETED":
+        "The record it belongs to (its case report or survey) was deleted in DHIS2; this record was not.",
+    "PARENT MISSING": "The record it belongs to does not exist in DHIS2 (or no link was recorded).",
+    "OUTSIDE EXTRACT":
+        "The record it belongs to exists in DHIS2 but under another org unit, outside this extract.",
+    "SURVEY MISMATCH": "Its own Survey_id differs from the Survey_id of the record it belongs to.",
+    "PARENT FLAGGED": "The record it belongs to is itself flagged; see that record's flag.",
 };
 
 export type FormData = {
@@ -186,6 +231,8 @@ export type FormData = {
     records: Record_[];
     /** Ordered value column UIDs -> display label. */
     columns: Map<string, string>;
+    /** Value column UID -> DHIS2 valueType; absent means the column is written as text. */
+    valueTypes?: Map<string, string>;
 };
 
 const EXCEL_MAX_ROWS = 1_048_576;
@@ -193,26 +240,66 @@ const EXCEL_MAX_ROWS = 1_048_576;
 /** Matches glass-dev's bulkDownloadAMUFiles.ts, which this server tolerates well. */
 const FETCH_CONCURRENCY = 6;
 
-/**
- * Lower than FETCH_CONCURRENCY: a form fetch pulls full record pages (attributes + every
- * event + every data value), which is far heavier per request than a discovery probe.
- */
+/** Programs being extracted at once. Their page requests share REQUEST_CONCURRENCY below. */
 const EXTRACT_CONCURRENCY = 3;
 
 /**
- * Runs `fn` over `items` with at most `limit` in flight, preserving input order in the
- * result. Bounded rather than unbounded so a wide form list can't open dozens of parallel
- * requests against DHIS2 at once.
+ * Full-page data requests in flight across the whole run. A page carries every attribute,
+ * event and value of up to --page-size records, far heavier than a discovery probe, so this
+ * one shared cap is what keeps the load on DHIS2 bounded however pages and programs overlap.
  */
-async function mapWithConcurrency<T, R>(
+const REQUEST_CONCURRENCY = 4;
+
+export type Limiter = <T>(task: () => Promise<T>) => Promise<T>;
+
+/**
+ * At most `limit` tasks run at once; the rest wait their turn in FIFO order. A finishing
+ * task hands its slot straight to the next waiter, so the limit is never overshot.
+ */
+export function createLimiter(limit: number): Limiter {
+    let active = 0;
+    const waiting: (() => void)[] = [];
+
+    return async task => {
+        if (active < limit) active++;
+        else await new Promise<void>(resolve => waiting.push(resolve));
+        try {
+            return await task();
+        } finally {
+            const next = waiting.shift();
+            if (next) next();
+            else active--;
+        }
+    };
+}
+
+/**
+ * Runs `fn` over `items` with at most `limit` in flight, preserving input order in the
+ * result. A pool, not fixed batches: a slow item holds up one slot, never the whole batch.
+ * Bounded so a wide list can't open dozens of parallel requests against DHIS2 at once.
+ * After a failure no further items are started.
+ */
+export async function mapWithConcurrency<T, R>(
     items: readonly T[],
     limit: number,
     fn: (item: T) => Promise<R>
 ): Promise<R[]> {
-    const results: R[] = [];
-    for (let i = 0; i < items.length; i += limit) {
-        results.push(...(await Promise.all(items.slice(i, i + limit).map(fn))));
-    }
+    const results = new Array<R>(items.length);
+    let next = 0;
+
+    const worker = async () => {
+        while (next < items.length) {
+            const index = next++;
+            try {
+                results[index] = await fn(items[index] as T);
+            } catch (err) {
+                next = items.length;
+                throw err;
+            }
+        }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
     return results;
 }
 
@@ -270,82 +357,90 @@ const SURVEY_LINK_BY_DEFAULT_UID: Record<string, string> = {
 
 // --- Resolution ---------------------------------------------------------------
 
-async function fetchModules(api: D2Api): Promise<AMRSurveyModule[]> {
+/**
+ * Fatal on failure: the datastore is what says which custom programs exist and which field
+ * links a record to its parent, so carrying on without it would silently drop whole programs.
+ */
+async function fetchModules(api: D2Api, session: SessionManager): Promise<AMRSurveyModule[]> {
     try {
-        const modules = await api
-            .get<AMRSurveyModule[]>("/dataStore/amr-surveys/modules")
-            .getData();
-        return Array.isArray(modules) ? modules : [];
-    } catch (err) {
-        console.warn(
-            "  ! Could not read datastore amr-surveys/modules; custom-form detection disabled."
+        const modules = await session.retryWithBackoff(() =>
+            api.get<AMRSurveyModule[]>("/dataStore/amr-surveys/modules").getData()
         );
-        return [];
+        if (!Array.isArray(modules)) throw new Error("unexpected content");
+        return modules;
+    } catch (err) {
+        throw new Error(
+            `Could not read datastore amr-surveys/modules (${
+                err instanceof Error ? err.message : err
+            }); ` + `custom forms and parent links cannot be resolved without it.`
+        );
     }
 }
 
-function normalise(name: string): string {
-    return name.trim().toLowerCase().replace(/\s+/g, " ");
+/** The default program plus every custom variant any survey configures for it. */
+export function candidateProgramIds(defaultUid: string, modules: AMRSurveyModule[]): string[] {
+    const customs = modules
+        .flatMap(module => Object.values(module.customForms ?? {}))
+        .map(forms => forms[defaultUid])
+        .filter((uid): uid is string => !!uid);
+    return [...new Set([defaultUid, ...customs])];
 }
 
 async function resolveForms(
     api: D2Api,
+    session: SessionManager,
     modules: AMRSurveyModule[],
     wanted: FormSpec[]
 ): Promise<{ resolved: ResolvedForm[]; unresolved: { spec: FormSpec; reason: string }[] }> {
-    const { programs, dataSets } = await api.metadata
-        .get({
-            programs: { fields: { id: true, name: true, programType: true } },
-            dataSets: { fields: { id: true, name: true } },
-        })
-        .getData();
+    const { programs, dataSets } = await session.retryWithBackoff(() =>
+        api.metadata
+            .get({
+                programs: { fields: { id: true, name: true, programType: true } },
+                dataSets: { fields: { id: true, name: true } },
+            })
+            .getData()
+    );
+
+    const onServer = new Map<string, { name: string; kind: FormKind }>();
+    for (const p of programs) {
+        onServer.set(p.id, {
+            name: p.name,
+            kind: p.programType === "WITH_REGISTRATION" ? "tracker" : "event",
+        });
+    }
+    for (const d of dataSets) onServer.set(d.id, { name: d.name, kind: "dataSet" });
 
     const resolved: ResolvedForm[] = [];
     const unresolved: { spec: FormSpec; reason: string }[] = [];
 
     for (const spec of wanted) {
-        const wantName = normalise(spec.requestedName);
-
-        const programMatches = programs.filter(p => normalise(p.name) === wantName);
-        const dataSetMatches = dataSets.filter(d => normalise(d.name) === wantName);
-        const matches = [
-            ...programMatches.map(p => ({
-                id: p.id,
-                name: p.name,
-                kind: (p.programType === "WITH_REGISTRATION" ? "tracker" : "event") as FormKind,
-            })),
-            ...dataSetMatches.map(d => ({ id: d.id, name: d.name, kind: "dataSet" as FormKind })),
-        ];
+        const matches = candidateProgramIds(spec.defaultUid, modules).flatMap(uid => {
+            const found = onServer.get(uid);
+            return found ? [{ uid, ...found }] : [];
+        });
 
         if (matches.length === 0) {
-            unresolved.push({ spec, reason: "no program or dataSet with this exact name" });
-            continue;
-        }
-        if (matches.length > 1) {
             unresolved.push({
                 spec,
-                reason: `ambiguous, ${matches.length} matches: ${matches
-                    .map(m => `${m.name} (${m.id})`)
-                    .join("; ")}`,
+                reason: `no program or dataSet with default UID ${spec.defaultUid} on this server`,
             });
             continue;
         }
 
-        const match = matches[0]!;
-        const defaultUid = getDefaultProgram(match.id, modules);
-        const parentLinkField =
-            match.kind === "dataSet" ? "" : getParentDataElementForProgram(match.id, modules);
-
-        resolved.push({
-            ...spec,
-            uid: match.id,
-            serverName: match.name,
-            kind: spec.kind ?? match.kind,
-            defaultUid,
-            isCustom: defaultUid !== match.id,
-            parentLinkField,
-            surveyLinkField: SURVEY_LINK_BY_DEFAULT_UID[defaultUid] ?? "",
-        });
+        for (const match of matches) {
+            resolved.push({
+                ...spec,
+                uid: match.uid,
+                serverName: match.name,
+                kind: spec.kind ?? match.kind,
+                isCustom: match.uid !== spec.defaultUid,
+                parentLinkField:
+                    match.kind === "dataSet"
+                        ? ""
+                        : getParentDataElementForProgram(match.uid, modules),
+                surveyLinkField: SURVEY_LINK_BY_DEFAULT_UID[spec.defaultUid] ?? "",
+            });
+        }
     }
 
     return { resolved, unresolved };
@@ -367,17 +462,18 @@ export function linkParents(resolved: ResolvedForm[]): void {
     }
 }
 
-function reportResolution(resolved: ResolvedForm[], unresolved: { spec: FormSpec; reason: string }[]) {
+function reportResolution(
+    resolved: ResolvedForm[],
+    unresolved: { spec: FormSpec; reason: string }[]
+) {
     console.log("\nResolved forms:");
     console.log(
         "  " +
-            ["KEY".padEnd(18), "UID".padEnd(13), "KIND".padEnd(8), "CUSTOM".padEnd(7), "NAME"].join("")
+            ["KEY".padEnd(18), "UID".padEnd(13), "KIND".padEnd(8), "CUSTOM".padEnd(7), "NAME"].join(
+                ""
+            )
     );
     for (const f of resolved) {
-        const drift =
-            f.expectedDefaultUid && f.defaultUid !== f.expectedDefaultUid
-                ? `  <-- default ${f.defaultUid} != expected ${f.expectedDefaultUid}`
-                : "";
         console.log(
             "  " +
                 [
@@ -386,8 +482,7 @@ function reportResolution(resolved: ResolvedForm[], unresolved: { spec: FormSpec
                     f.kind.padEnd(8),
                     (f.isCustom ? "yes" : "no").padEnd(7),
                     f.serverName,
-                ].join("") +
-                drift
+                ].join("")
         );
         if (f.kind !== "dataSet" && !f.parentLinkField && f.parentKey) {
             console.warn(
@@ -433,32 +528,56 @@ export type ProgramMeta = {
     attributes: Map<string, string>;
     /** attribute id -> its position in the program, so attribute columns keep form order. */
     attributeOrder: Map<string, number>;
-    /** Used by fetchEvents (event programs have no stages in the model here). */
-    dataElements: Map<string, string>;
     stageById: Map<string, ProgramStageMeta>;
+    /** dataElement/attribute id -> DHIS2 valueType; decides numeric and date cells. */
+    valueTypes: Map<string, string>;
+    /** dataElement/attribute id -> (option code -> option name), for option-set fields. */
+    optionNames: Map<string, Map<string, string>>;
 };
+
+/** The option's name where the field is option-backed, else the stored value unchanged. */
+function displayValue(meta: ProgramMeta, fieldId: string, value: string): string {
+    return meta.optionNames.get(fieldId)?.get(value) ?? value;
+}
 
 /**
- * Not every dataElement/attribute referenced by a real value is guaranteed to appear in
- * either its own stage's config or the program's flat dataElement list — verified live: a
- * dataElement can be unassigned from a stage yet still hold historical values, and absent
- * from the program's flat /programs/{id} dataElements too. A raw id in a header is a
- * completeness signal users cannot silently miss, so any id that resists resolution here
- * is queued for one direct-fetch rescue attempt rather than left as-is.
+ * A field that holds values but is not on the current form: a data element since removed
+ * from its stage (verified live: thousands of historical values on the case report form) or
+ * an attribute no longer on the program. Its values are kept. Its column is labelled with
+ * the field's full DHIS2 name, which, unlike the form text ("Route"), says which slot it was
+ * ("Route1.1YES"), and is marked so nobody mistakes it for a current question.
  */
-export type PendingHeaderPatch =
-    | { kind: "attribute"; id: string }
-    | { kind: "mainStageDataElement"; id: string; stageName: string }
-    | { kind: "childStageDataElement"; id: string; stageId: string };
-
-export type UnresolvedHeaderTracker = {
-    dataElementIds: Set<string>;
-    attributeIds: Set<string>;
-    patches: PendingHeaderPatch[];
+export type OffFormField = {
+    kind: "dataElement" | "trackedEntityAttribute";
+    id: string;
+    /** Column sort position: just after the fields of the stage it was recorded on. */
+    position: number;
+    /** Label prefix ("Stage name: ") for main-sheet stage columns, else "". */
+    prefix: string;
+    /** Values seen, for the _index listing. */
+    values: number;
+    /** Known once its metadata is fetched (see labelOffFormFields). */
+    valueType?: string;
 };
 
-export function newUnresolvedHeaderTracker(): UnresolvedHeaderTracker {
-    return { dataElementIds: new Set(), attributeIds: new Set(), patches: [] };
+/** Sheet ("" = the main sheet, else a repeatable stage id) -> column key -> off-form field. */
+export type OffFormTracker = Map<string, Map<string, OffFormField>>;
+
+const OFF_FORM_MARK = "[not on current form]";
+
+/** Counts one value of an off-form column, registering the column on first sight. */
+function noteOffForm(
+    tracker: OffFormTracker | undefined,
+    sheet: string,
+    columnKey: string,
+    field: Omit<OffFormField, "values">
+): void {
+    if (!tracker) return;
+    let fields = tracker.get(sheet);
+    if (!fields) tracker.set(sheet, (fields = new Map()));
+    const known = fields.get(columnKey);
+    if (known) known.values++;
+    else fields.set(columnKey, { ...field, values: 1 });
 }
 
 /**
@@ -469,15 +588,21 @@ export function newUnresolvedHeaderTracker(): UnresolvedHeaderTracker {
  */
 const programMetaCache = new Map<string, Promise<ProgramMeta>>();
 
-function fetchProgramMeta(api: D2Api, programId: string): Promise<ProgramMeta> {
+function fetchProgramMeta(
+    api: D2Api,
+    session: SessionManager,
+    programId: string
+): Promise<ProgramMeta> {
     const cached = programMetaCache.get(programId);
     if (cached) return cached;
-    // Evict on failure, so a transient error doesn't poison every later caller with the
-    // same rejected promise and defeat the surrounding retry.
-    const pending = fetchProgramMetaUncached(api, programId).catch(err => {
-        programMetaCache.delete(programId);
-        throw err;
-    });
+    // Evict on failure, so a failure that outlasts the retries doesn't poison every later
+    // caller with the same rejected promise.
+    const pending = session
+        .retryWithBackoff(() => fetchProgramMetaUncached(api, programId))
+        .catch(err => {
+            programMetaCache.delete(programId);
+            throw err;
+        });
     programMetaCache.set(programId, pending);
     return pending;
 }
@@ -494,6 +619,14 @@ type D2ProgramStage = {
     programStageSections?: { name: string; sortOrder?: number; dataElements?: { id: string }[] }[];
 };
 
+type ProgramField = {
+    id: string;
+    name: string;
+    formName?: string;
+    valueType?: string;
+    optionSet?: { id: string };
+};
+
 async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<ProgramMeta> {
     // Two calls, because /programs/{id}/metadata.json does not reliably honour a nested
     // field selector for programStages (verified: it returns stage dataElement ids but
@@ -507,10 +640,11 @@ async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<
                         trackedEntityAttribute: { id: string; name: string; formName?: string };
                     }[];
                 }[];
-                dataElements?: { id: string; name: string; formName?: string }[];
-                trackedEntityAttributes?: { id: string; name: string; formName?: string }[];
+                dataElements?: ProgramField[];
+                trackedEntityAttributes?: ProgramField[];
+                options?: { code: string; name: string; optionSet?: { id: string } }[];
             }>(`/programs/${programId}/metadata.json`, {
-                fields: "programs,dataElements,trackedEntityAttributes,programTrackedEntityAttributes",
+                fields: "programs,dataElements,trackedEntityAttributes,programTrackedEntityAttributes,options",
             })
             .getData(),
         api
@@ -538,11 +672,6 @@ async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<
         });
     }
 
-    const dataElements = new Map<string, string>();
-    for (const de of program.dataElements ?? []) {
-        dataElements.set(de.id, de.formName || de.name);
-    }
-
     const stages = [...(stagesResp.programStages ?? [])].sort(
         (a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0)
     );
@@ -556,10 +685,12 @@ async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<
             dataElementLabels.set(de.id, de.formName || de.name);
             dataElementOrder.set(de.id, psde.sortOrder ?? index);
         });
+        placeSpeciesOtherAfterSpecies(dataElementLabels, dataElementOrder);
 
         const dataElementSection = new Map<string, string>();
         for (const section of stage.programStageSections ?? []) {
-            for (const de of section.dataElements ?? []) dataElementSection.set(de.id, section.name);
+            for (const de of section.dataElements ?? [])
+                dataElementSection.set(de.id, section.name);
         }
 
         stageById.set(stage.id, {
@@ -573,14 +704,61 @@ async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<
         });
     });
 
-    return { attributes, attributeOrder, dataElements, stageById };
+    const namesByOptionSet = new Map<string, Map<string, string>>();
+    for (const option of program.options ?? []) {
+        const setId = option.optionSet?.id;
+        if (!setId) continue;
+        const names = namesByOptionSet.get(setId) ?? new Map<string, string>();
+        names.set(option.code, option.name);
+        namesByOptionSet.set(setId, names);
+    }
+
+    const valueTypes = new Map<string, string>();
+    const optionNames = new Map<string, Map<string, string>>();
+    for (const field of [
+        ...(program.dataElements ?? []),
+        ...(program.trackedEntityAttributes ?? []),
+    ]) {
+        if (field.valueType) valueTypes.set(field.id, field.valueType);
+        const names = field.optionSet && namesByOptionSet.get(field.optionSet.id);
+        if (names) optionNames.set(field.id, names);
+    }
+
+    return { attributes, attributeOrder, stageById, valueTypes, optionNames };
+}
+
+const SPECIES_LABEL = "Specify the species";
+const SPECIES_OTHER_LABEL = "Species, other";
+
+/**
+ * On the Central Ref Lab form, the free-text "Species, other" (what the lab typed when the
+ * species list had no match) is the last field of each species stage, ~120 columns after
+ * the "Specify the species" it qualifies, with the antibiotic blocks in between. Anyone
+ * reading the export sees "Other" and never reaches the text, so move it to sit directly
+ * after its species. Mutates `order`; a stage lacking either field is left untouched.
+ */
+export function placeSpeciesOtherAfterSpecies(
+    labels: Map<string, string>,
+    order: Map<string, number>
+): void {
+    const idOf = (label: string) => [...labels].find(([, l]) => l === label)?.[0];
+    const speciesId = idOf(SPECIES_LABEL);
+    const otherId = idOf(SPECIES_OTHER_LABEL);
+    const speciesPosition = speciesId === undefined ? undefined : order.get(speciesId);
+    if (otherId === undefined || speciesPosition === undefined) return;
+
+    order.set(otherId, speciesPosition + 0.5);
 }
 
 /**
  * The label a column gets, before de-duplication: the form's own section name where the
  * stage defines one (e.g. "S1 - Antibiotic 1"), otherwise the stage name.
  */
-function stageColumnLabel(stage: ProgramStageMeta, dataElementId: string, fieldLabel: string): string {
+function stageColumnLabel(
+    stage: ProgramStageMeta,
+    dataElementId: string,
+    fieldLabel: string
+): string {
     return `${stage.dataElementSection.get(dataElementId) ?? stage.name}: ${fieldLabel}`;
 }
 
@@ -592,6 +770,11 @@ const STAGE_COLUMN_PREFIX = "stage:";
 
 /** Where a column belongs in form order. Attributes first, then stage data in stage order. */
 const STAGE_COLUMN_OFFSET = 1_000_000;
+
+/** Sorts after every field of `stage` (or, with no stage, after every attribute). */
+function afterStagePosition(stage: ProgramStageMeta | undefined): number {
+    return STAGE_COLUMN_OFFSET * (1 + (stage ? 1 + stage.sortOrder : 0)) - 1;
+}
 
 function columnSortKey(columnKey: string, meta: ProgramMeta): number {
     const isStageValue = columnKey.startsWith(STAGE_COLUMN_PREFIX);
@@ -613,25 +796,39 @@ function columnSortKey(columnKey: string, meta: ProgramMeta): number {
 }
 
 /**
- * Puts columns into form order and guarantees every header is unique.
- *
- * Order matters for reading: the Central Ref Lab form repeats a 4-field block per
- * antibiotic, and without this the antibiotic and its own AST result do not end up
- * side by side. Uniqueness matters because a repeated block reuses the same field names
- * — a bare "Specify the antibiotic" appearing 24 times tells the reader nothing. Where a
- * label still repeats after section prefixing, occurrences are numbered in form order.
+ * Puts columns into form order. Order matters for reading: the Central Ref Lab form repeats
+ * a 4-field block per antibiotic, and without this the antibiotic and its own AST result do
+ * not end up side by side. Off-form columns go after their stage's fields, by label.
  */
-export function finalizeColumns(columns: Map<string, string>, meta: ProgramMeta): Map<string, string> {
-    const ordered = [...columns.entries()].sort(
-        ([a], [b]) => columnSortKey(a, meta) - columnSortKey(b, meta)
+export function orderColumns(
+    columns: Map<string, string>,
+    meta: ProgramMeta,
+    offForm?: Map<string, OffFormField>
+): Map<string, string> {
+    const position = (key: string) => offForm?.get(key)?.position ?? columnSortKey(key, meta);
+    return new Map(
+        [...columns.entries()].sort(
+            ([a, labelA], [b, labelB]) =>
+                position(a) - position(b) ||
+                labelA.localeCompare(labelB, undefined, { numeric: true })
+        )
     );
+}
 
+/**
+ * Makes every header unique, keeping order. A repeated block reuses the same field names — a
+ * bare "Specify the antibiotic" appearing 24 times tells the reader nothing — and two
+ * programs merged into one sheet can each bring a field with the same label. Where a label
+ * still repeats, occurrences are numbered in column order. Applied once, at write time, so it
+ * sees the final (merged) column set.
+ */
+export function uniqueLabels(columns: Map<string, string>): Map<string, string> {
     const labelCounts = new Map<string, number>();
-    for (const [, label] of ordered) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+    for (const label of columns.values()) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
 
     const seen = new Map<string, number>();
     const result = new Map<string, string>();
-    for (const [key, label] of ordered) {
+    for (const [key, label] of columns) {
         if ((labelCounts.get(label) ?? 0) === 1) {
             result.set(key, label);
             continue;
@@ -650,6 +847,12 @@ type FetchOpts = {
     pageSize: number;
     startDate?: string;
     endDate?: string;
+    /** Discovered record count of the program being fetched, when known: enables parallel pages. */
+    total?: number;
+    /** The run's shared cap on full-page data requests. */
+    requests: Limiter;
+    /** Org units to read dataSets under when no --org-unit/--country scope is given. */
+    dataSetRoots?: string[];
 };
 
 /**
@@ -657,11 +860,17 @@ type FetchOpts = {
  * predicts a sheet's shape before any records are fetched) can never drift from what the
  * real fetch functions below actually write — both reference the same `.length`.
  */
-const TRACKER_MAIN_META_KEYS = ["created_at", "updated_at", "enrolled_at", "status"] as const;
-const TRACKER_STAGE_CHILD_META_KEYS = ["occurred_at", "status"] as const;
-const EVENT_META_KEYS = ["occurred_at", "created_at", "updated_at", "status"] as const;
-/** path, record_id, org_unit_id, org_unit_name — present on every sheet regardless of kind. */
-const FIXED_NON_META_COLUMNS = 4;
+const TRACKER_MAIN_META_KEYS = [
+    "created_at",
+    "updated_at",
+    "enrolled_at",
+    "status",
+    "program",
+] as const;
+const TRACKER_STAGE_CHILD_META_KEYS = ["occurred_at", "status", "program"] as const;
+const EVENT_META_KEYS = ["occurred_at", "created_at", "updated_at", "status", "program"] as const;
+/** flag, flag_detail, path, record_id, org_unit_id, org_unit_name — on every sheet regardless of kind. */
+const FIXED_NON_META_COLUMNS = 6;
 
 /**
  * The ResolvedForm shape a repeatable stage's child sheet gets. Shared by fetchTracker
@@ -669,7 +878,11 @@ const FIXED_NON_META_COLUMNS = 4;
  * extraction runs), so a predicted sheet can never describe a shape extraction wouldn't
  * actually produce.
  */
-export function buildStageChildForm(owner: ResolvedForm, stage: ProgramStageMeta, childKey: string): ResolvedForm {
+export function buildStageChildForm(
+    owner: ResolvedForm,
+    stage: ProgramStageMeta,
+    childKey: string
+): ResolvedForm {
     return {
         key: childKey,
         requestedName: stage.name,
@@ -691,7 +904,11 @@ export function buildStageChildForm(owner: ResolvedForm, stage: ProgramStageMeta
  * the same owner + stage processed in the same (id-sorted) order, this always produces the
  * same key — which is what lets discovery's prediction match extraction's actual output.
  */
-export function assignStageChildKey(ownerKey: string, stage: ProgramStageMeta, usedKeys: Set<string>): string {
+export function assignStageChildKey(
+    ownerKey: string,
+    stage: ProgramStageMeta,
+    usedKeys: Set<string>
+): string {
     const baseKey = `${ownerKey}__${pascalizeStageName(stage.name)}`;
     const childKey = usedKeys.has(baseKey) ? `${baseKey}__${stage.id}` : baseKey;
     usedKeys.add(childKey);
@@ -707,24 +924,25 @@ function ouParams(orgUnit: string | undefined) {
 }
 
 /**
- * Guards the paging loops. A server that ignores the `page` parameter would
- * otherwise return the same page forever; bail out as soon as a page adds no
- * record we have not already seen.
+ * Guards the paging loops. Returns the items of a page not seen on an earlier page, so a
+ * record that shifts between pages while the data changes is never written twice. Returns
+ * undefined once a page adds nothing new: a server that ignores `page` would otherwise
+ * return the same page forever.
  */
-function makePageGuard(formKey: string) {
+export function makePageGuard(formKey: string) {
     const seen = new Set<string>();
 
-    return function accept(ids: string[]): boolean {
-        const added = ids.filter(id => !seen.has(id));
-        added.forEach(id => seen.add(id));
+    return function fresh<T>(items: T[], idOf: (item: T) => string): T[] | undefined {
+        const added = items.filter(item => !seen.has(idOf(item)));
+        added.forEach(item => seen.add(idOf(item)));
 
-        if (ids.length > 0 && added.length === 0) {
+        if (items.length > 0 && added.length === 0) {
             console.warn(
                 `\n  ! ${formKey}: a page returned no new records; stopping to avoid a paging loop.`
             );
-            return false;
+            return undefined;
         }
-        return true;
+        return added;
     };
 }
 
@@ -764,7 +982,8 @@ export type StageChildRecord = { stageId: string; record: Record_ };
  * Builds one TEI's main row (attributes + non-repeatable-stage dataValues merged in)
  * plus one child Record_ per repeatable-stage event. Mutates `columns` and
  * `stageColumns` (per stage id) with any newly-seen column, matching the accumulation
- * pattern the rest of this file uses.
+ * pattern the rest of this file uses. Values of fields no longer on the form are kept and
+ * noted in `offForm` (see OffFormField).
  */
 export function buildTrackerRecords(
     tei: TrackedEntityInput,
@@ -773,23 +992,26 @@ export function buildTrackerRecords(
     columns: Map<string, string>,
     stageColumns: Map<string, Map<string, string>>,
     report?: IntegrityReport,
-    unresolvedHeaders?: UnresolvedHeaderTracker
+    offForm?: OffFormTracker
 ): { main: Record_; stageRecords: StageChildRecord[] } {
     const values = new Map<string, string>();
     for (const attr of tei.attributes ?? []) {
         if (attr.value === undefined || attr.value === null) continue;
-        values.set(attr.attribute, String(attr.value));
-        if (!columns.has(attr.attribute)) {
-            const label = meta.attributes.get(attr.attribute);
-            columns.set(attr.attribute, label ?? attr.attribute);
-            if (!label && unresolvedHeaders) {
-                unresolvedHeaders.attributeIds.add(attr.attribute);
-                unresolvedHeaders.patches.push({ kind: "attribute", id: attr.attribute });
-            }
+        values.set(attr.attribute, displayValue(meta, attr.attribute, String(attr.value)));
+        const label = meta.attributes.get(attr.attribute);
+        if (label === undefined) {
+            noteOffForm(offForm, "", attr.attribute, {
+                kind: "trackedEntityAttribute",
+                id: attr.attribute,
+                position: afterStagePosition(undefined),
+                prefix: "",
+            });
         }
+        if (!columns.has(attr.attribute)) columns.set(attr.attribute, label ?? attr.attribute);
     }
 
     const stageRecords: StageChildRecord[] = [];
+    const filledStages = new Set<string>();
 
     for (const event of tei.events ?? []) {
         const stage = meta.stageById.get(event.programStage);
@@ -802,24 +1024,32 @@ export function buildTrackerRecords(
         }
 
         if (!stage.repeatable) {
+            // A single-entry stage's values share one row, so a second event with data
+            // overwrites the first's. Not silent: counted and surfaced in _index.
+            if ((event.dataValues?.length ?? 0) > 0) {
+                if (filledStages.has(stage.id) && report) {
+                    incrementStageCount(report.duplicateStageEvents, form.key, stage.id);
+                }
+                filledStages.add(stage.id);
+            }
             for (const dv of event.dataValues ?? []) {
                 if (dv.value === undefined || dv.value === null) continue;
                 const key = `${STAGE_COLUMN_PREFIX}${dv.dataElement}`;
-                values.set(key, String(dv.value));
+                values.set(key, displayValue(meta, dv.dataElement, String(dv.value)));
+                const label = stage.dataElementLabels.get(dv.dataElement);
+                if (label === undefined) {
+                    noteOffForm(offForm, "", key, {
+                        kind: "dataElement",
+                        id: dv.dataElement,
+                        position: afterStagePosition(stage),
+                        prefix: `${stage.name}: `,
+                    });
+                }
                 if (!columns.has(key)) {
-                    // Tier 1: this stage's own config. Tier 2: the program's flat dataElement
-                    // list — catches a dataElement that has since been unassigned from this
-                    // stage but still holds historical values (verified live).
-                    const label = stage.dataElementLabels.get(dv.dataElement) ?? meta.dataElements.get(dv.dataElement);
-                    columns.set(key, stageColumnLabel(stage, dv.dataElement, label ?? dv.dataElement));
-                    if (!label && unresolvedHeaders) {
-                        unresolvedHeaders.dataElementIds.add(dv.dataElement);
-                        unresolvedHeaders.patches.push({
-                            kind: "mainStageDataElement",
-                            id: dv.dataElement,
-                            stageName: stage.dataElementSection.get(dv.dataElement) ?? stage.name,
-                        });
-                    }
+                    columns.set(
+                        key,
+                        stageColumnLabel(stage, dv.dataElement, label ?? dv.dataElement)
+                    );
                 }
             }
         }
@@ -839,7 +1069,9 @@ export function buildTrackerRecords(
             ["updated_at", tei.updatedAt ?? ""],
             ["enrolled_at", tei.enrollment?.enrolledAt ?? ""],
             ["status", tei.enrollment?.status ?? ""],
+            ["program", form.serverName],
         ]),
+        flags: [],
     };
 
     for (const event of tei.events ?? []) {
@@ -856,19 +1088,18 @@ export function buildTrackerRecords(
         }
         for (const dv of event.dataValues ?? []) {
             if (dv.value === undefined || dv.value === null) continue;
-            childValues.set(dv.dataElement, String(dv.value));
-            if (!childColumns.has(dv.dataElement)) {
-                const label = stage.dataElementLabels.get(dv.dataElement) ?? meta.dataElements.get(dv.dataElement);
-                childColumns.set(dv.dataElement, label ?? dv.dataElement);
-                if (!label && unresolvedHeaders) {
-                    unresolvedHeaders.dataElementIds.add(dv.dataElement);
-                    unresolvedHeaders.patches.push({
-                        kind: "childStageDataElement",
-                        id: dv.dataElement,
-                        stageId: stage.id,
-                    });
-                }
+            childValues.set(dv.dataElement, displayValue(meta, dv.dataElement, String(dv.value)));
+            const label = stage.dataElementLabels.get(dv.dataElement);
+            if (label === undefined) {
+                noteOffForm(offForm, stage.id, dv.dataElement, {
+                    kind: "dataElement",
+                    id: dv.dataElement,
+                    position: afterStagePosition(stage),
+                    prefix: "",
+                });
             }
+            if (!childColumns.has(dv.dataElement))
+                childColumns.set(dv.dataElement, label ?? dv.dataElement);
         }
 
         stageRecords.push({
@@ -884,7 +1115,9 @@ export function buildTrackerRecords(
                 meta: new Map([
                     ["occurred_at", event.occurredAt ?? ""],
                     ["status", event.status ?? ""],
+                    ["program", form.serverName],
                 ]),
+                flags: [],
             },
         });
     }
@@ -892,91 +1125,116 @@ export function buildTrackerRecords(
     return { main, stageRecords };
 }
 
-/** Batched direct fetch of dataElement display labels for an arbitrary id list. */
-async function fetchDataElementLabels(
-    api: D2Api,
-    ids: string[],
-    session: SessionManager
-): Promise<Map<string, string>> {
-    const labels = new Map<string, string>();
-    if (ids.length === 0) return labels;
-    const resp = await session.retryWithBackoff(() =>
-        api
-            .get<{ dataElements?: { id: string; name: string; formName?: string }[] }>("/dataElements.json", {
-                filter: `id:in:[${ids.join(",")}]`,
-                fields: "id,name,formName",
-                paging: false,
-            })
-            .getData()
-    );
-    for (const de of resp.dataElements ?? []) labels.set(de.id, de.formName || de.name);
-    return labels;
-}
+/** Ids per metadata request: keeps `id:in:[...]` URLs well under server limits. */
+const ID_BATCH = 100;
 
-/** Batched direct fetch of tracked-entity-attribute display labels for an arbitrary id list. */
-async function fetchAttributeLabels(
-    api: D2Api,
-    ids: string[],
-    session: SessionManager
-): Promise<Map<string, string>> {
-    const labels = new Map<string, string>();
-    if (ids.length === 0) return labels;
-    const resp = await session.retryWithBackoff(() =>
-        api
-            .get<{ trackedEntityAttributes?: { id: string; name: string; formName?: string }[] }>(
-                "/trackedEntityAttributes.json",
-                { filter: `id:in:[${ids.join(",")}]`, fields: "id,name,formName", paging: false }
-            )
-            .getData()
-    );
-    for (const a of resp.trackedEntityAttributes ?? []) labels.set(a.id, a.formName || a.name);
-    return labels;
-}
+type FieldInfo = { name: string; valueType?: string; options: Map<string, string> };
 
-/**
- * Tier 3: a single batched direct fetch for every id that resisted tiers 1-2 across an
- * entire form's extraction (not per-record — `columns.has(key)` guards mean each distinct
- * id only ever queues one patch), then rewrites the affected column labels in place. Any
- * id that STILL doesn't resolve — genuinely deleted from DHIS2, not merely unassigned from
- * a stage — is recorded in `report.unresolvedHeaders` rather than left silently as a UID.
- */
-async function resolveStrayHeaderLabels(
+/** Full name, valueType and option names of the given fields. */
+async function fetchFieldInfo(
     api: D2Api,
-    formKey: string,
-    tracker: UnresolvedHeaderTracker,
-    columns: Map<string, string>,
-    stageColumnsByStageId: Map<string, Map<string, string>>,
     session: SessionManager,
-    report: IntegrityReport
-): Promise<void> {
-    if (tracker.patches.length === 0) return;
+    kind: OffFormField["kind"],
+    ids: string[]
+): Promise<Map<string, FieldInfo>> {
+    const endpoint = kind === "dataElement" ? "dataElements" : "trackedEntityAttributes";
+    const info = new Map<string, FieldInfo>();
 
-    const [dataElementLabels, attributeLabels] = await Promise.all([
-        fetchDataElementLabels(api, [...tracker.dataElementIds], session),
-        fetchAttributeLabels(api, [...tracker.attributeIds], session),
-    ]);
-
-    for (const patch of tracker.patches) {
-        if (patch.kind === "attribute") {
-            const label = attributeLabels.get(patch.id);
-            if (label) columns.set(patch.id, label);
-            else report.unresolvedHeaders.push({ formKey, id: patch.id, kind: "trackedEntityAttribute" });
-        } else if (patch.kind === "mainStageDataElement") {
-            const label = dataElementLabels.get(patch.id);
-            if (label) columns.set(`${STAGE_COLUMN_PREFIX}${patch.id}`, `${patch.stageName}: ${label}`);
-            else report.unresolvedHeaders.push({ formKey, id: patch.id, kind: "dataElement" });
-        } else {
-            const label = dataElementLabels.get(patch.id);
-            const childColumns = stageColumnsByStageId.get(patch.stageId);
-            if (label && childColumns) childColumns.set(patch.id, label);
-            else if (!label) report.unresolvedHeaders.push({ formKey, id: patch.id, kind: "dataElement" });
+    for (let i = 0; i < ids.length; i += ID_BATCH) {
+        const batch = ids.slice(i, i + ID_BATCH);
+        const resp = await session.retryWithBackoff(() =>
+            api
+                .get<{
+                    [endpoint: string]:
+                        | {
+                              id: string;
+                              name: string;
+                              valueType?: string;
+                              optionSet?: { options?: { code: string; name: string }[] };
+                          }[]
+                        | undefined;
+                }>(`/${endpoint}.json`, {
+                    filter: `id:in:[${batch.join(",")}]`,
+                    fields: "id,name,valueType,optionSet[options[code,name]]",
+                    paging: false,
+                })
+                .getData()
+        );
+        for (const field of resp[endpoint] ?? []) {
+            info.set(field.id, {
+                name: field.name,
+                valueType: field.valueType,
+                options: new Map((field.optionSet?.options ?? []).map(o => [o.code, o.name])),
+            });
         }
     }
+    return info;
+}
 
-    console.warn(
-        `  ! ${formKey}: ${tracker.patches.length} column header(s) needed a direct-fetch rescue ` +
-            `(stage config / program metadata didn't have the name)`
-    );
+type SheetInProgress = { columns: Map<string, string>; records: Record_[] };
+
+/**
+ * Labels the off-form columns of one program's sheets with each field's full DHIS2 name,
+ * turns their option codes into names (the program's own metadata no longer covers them)
+ * and records their valueType. A field whose metadata is gone entirely keeps its id as the
+ * label and is reported in report.unresolvedHeaders.
+ */
+async function labelOffFormFields(
+    api: D2Api,
+    session: SessionManager,
+    formKey: string,
+    tracker: OffFormTracker,
+    sheets: Map<string, SheetInProgress>,
+    report: IntegrityReport
+): Promise<void> {
+    const fields = [...tracker.values()].flatMap(byColumn => [...byColumn.values()]);
+    if (fields.length === 0) return;
+
+    const idsOf = (kind: OffFormField["kind"]) => [
+        ...new Set(fields.filter(f => f.kind === kind).map(f => f.id)),
+    ];
+    const [dataElements, attributes] = await Promise.all([
+        fetchFieldInfo(api, session, "dataElement", idsOf("dataElement")),
+        fetchFieldInfo(api, session, "trackedEntityAttribute", idsOf("trackedEntityAttribute")),
+    ]);
+
+    for (const [sheet, byColumn] of tracker) {
+        const target = sheets.get(sheet);
+        if (!target) continue;
+
+        for (const [columnKey, field] of byColumn) {
+            const info = (field.kind === "dataElement" ? dataElements : attributes).get(field.id);
+            if (!info) {
+                target.columns.set(columnKey, `${field.prefix}${field.id} [deleted field]`);
+                report.unresolvedHeaders.push({ formKey, id: field.id, kind: field.kind });
+                continue;
+            }
+            target.columns.set(columnKey, `${field.prefix}${info.name} ${OFF_FORM_MARK}`);
+            field.valueType = info.valueType;
+            if (info.options.size === 0) continue;
+            for (const record of target.records) {
+                const value = record.values.get(columnKey);
+                const name = value === undefined ? undefined : info.options.get(value);
+                if (name !== undefined) record.values.set(columnKey, name);
+            }
+        }
+    }
+}
+
+/** Lists a sheet's off-form columns, with their value counts, for _index. */
+function reportOffForm(
+    report: IntegrityReport,
+    sheet: string,
+    fields: Map<string, OffFormField> | undefined,
+    columns: Map<string, string>
+): void {
+    for (const [columnKey, field] of fields ?? []) {
+        report.offFormFields.push({
+            sheet,
+            column: columns.get(columnKey) ?? columnKey,
+            values: field.values,
+        });
+    }
 }
 
 /**
@@ -990,6 +1248,57 @@ export function pascalizeStageName(name: string): string {
     return pascal || "Stage";
 }
 
+/** The valueType of each column, so the writer can emit real numbers and dates. */
+function columnValueTypes(
+    columns: Map<string, string>,
+    meta: ProgramMeta,
+    offForm?: Map<string, OffFormField>
+): Map<string, string> {
+    const types = new Map<string, string>();
+    for (const key of columns.keys()) {
+        const fieldId = key.startsWith(STAGE_COLUMN_PREFIX)
+            ? key.slice(STAGE_COLUMN_PREFIX.length)
+            : key;
+        const type = offForm?.get(key)?.valueType ?? meta.valueTypes.get(fieldId);
+        if (type) types.set(key, type);
+    }
+    return types;
+}
+
+/**
+ * Every record of a paged endpoint, in page order, each once. With a known total (from
+ * discovery) every page is requested at once and the shared request limiter paces them;
+ * without one, and past the known pages if records were added since discovery, pages are
+ * read one at a time until a short page. A record that shifts between pages while the data
+ * changes is kept once; reconciliation reports any change in count.
+ */
+export async function fetchAllPages<T>(
+    formKey: string,
+    pageSize: number,
+    total: number | undefined,
+    fetchPage: (page: number) => Promise<T[]>,
+    idOf: (item: T) => string
+): Promise<T[]> {
+    const fresh = makePageGuard(formKey);
+    const items: T[] = [];
+    const take = (page: T[]): boolean => {
+        const added = fresh(page, idOf);
+        if (added) items.push(...added);
+        return added !== undefined;
+    };
+
+    const known = total ? Math.ceil(total / pageSize) : 0;
+    const pages = await Promise.all(Array.from({ length: known }, (_, i) => fetchPage(i + 1)));
+    pages.forEach(take);
+
+    let last = pages[pages.length - 1];
+    for (let page = known + 1; !last || last.length === pageSize; page++) {
+        last = await fetchPage(page);
+        if (!take(last)) break;
+    }
+    return items;
+}
+
 async function fetchTracker(
     api: D2Api,
     form: ResolvedForm,
@@ -998,87 +1307,91 @@ async function fetchTracker(
     session: SessionManager,
     report: IntegrityReport
 ): Promise<{ main: FormData; stageForms: FormData[] }> {
+    const teis = await fetchAllPages(
+        form.key,
+        opts.pageSize,
+        opts.total,
+        page =>
+            opts
+                .requests(() =>
+                    session.retryWithBackoff(() =>
+                        api.tracker.trackedEntities
+                            .get({
+                                fields: {
+                                    trackedEntity: true,
+                                    orgUnit: true,
+                                    createdAt: true,
+                                    updatedAt: true,
+                                    attributes: { attribute: true, value: true },
+                                    enrollments: {
+                                        enrollment: true,
+                                        enrolledAt: true,
+                                        status: true,
+                                        events: {
+                                            event: true,
+                                            programStage: true,
+                                            occurredAt: true,
+                                            status: true,
+                                            dataValues: { dataElement: true, value: true },
+                                        },
+                                    },
+                                },
+                                program: form.uid,
+                                ...ouParams(opts.orgUnit),
+                                // An explicit order keeps pages stable while records are added.
+                                order: [{ type: "field", field: "createdAt", direction: "asc" }],
+                                page,
+                                pageSize: opts.pageSize,
+                                totalPages: false,
+                            })
+                            .getData()
+                    )
+                )
+                .then(resp => resp.instances ?? []),
+        tei => tei.trackedEntity
+    );
+
     const records: Record_[] = [];
     const columns = new Map<string, string>();
-    const accept = makePageGuard(form.key);
-    // stage id -> accumulated child rows / columns, across all pages.
+    // stage id -> child rows / columns of a repeatable stage.
     const stageRows = new Map<string, Record_[]>();
     const stageColumns = new Map<string, Map<string, string>>();
-    const unresolvedHeaders = newUnresolvedHeaderTracker();
-    let page = 1;
+    const offForm: OffFormTracker = new Map();
 
-    for (;;) {
-        const currentPage = page;
-        const resp = await session.retryWithBackoff(() =>
-            api.tracker.trackedEntities
-                .get({
-                    fields: {
-                        trackedEntity: true,
-                        orgUnit: true,
-                        createdAt: true,
-                        updatedAt: true,
-                        attributes: { attribute: true, value: true },
-                        enrollments: {
-                            enrollment: true,
-                            enrolledAt: true,
-                            status: true,
-                            events: {
-                                event: true,
-                                programStage: true,
-                                occurredAt: true,
-                                status: true,
-                                dataValues: { dataElement: true, value: true },
-                            },
-                        },
-                    },
-                    program: form.uid,
-                    ...ouParams(opts.orgUnit),
-                    page: currentPage,
-                    pageSize: opts.pageSize,
-                    totalPages: false,
-                })
-                .getData()
+    for (const tei of teis) {
+        const enrollments = tei.enrollments ?? [];
+        const first = enrollments[0];
+        const { main, stageRecords } = buildTrackerRecords(
+            {
+                trackedEntity: tei.trackedEntity,
+                orgUnit: tei.orgUnit,
+                createdAt: tei.createdAt,
+                updatedAt: tei.updatedAt,
+                attributes: tei.attributes,
+                enrollment: first && { enrolledAt: first.enrolledAt, status: first.status },
+                events: enrollments.flatMap(e => e.events ?? []),
+            },
+            form,
+            meta,
+            columns,
+            stageColumns,
+            report,
+            offForm
         );
-
-        const instances = resp.instances ?? [];
-        if (!accept(instances.map(tei => tei.trackedEntity))) break;
-
-        for (const tei of instances) {
-            const enrollments = tei.enrollments ?? [];
-            const first = enrollments[0];
-            const { main, stageRecords } = buildTrackerRecords(
-                {
-                    trackedEntity: tei.trackedEntity,
-                    orgUnit: tei.orgUnit,
-                    createdAt: tei.createdAt,
-                    updatedAt: tei.updatedAt,
-                    attributes: tei.attributes,
-                    enrollment: first && { enrolledAt: first.enrolledAt, status: first.status },
-                    events: enrollments.flatMap(e => e.events ?? []),
-                },
-                form,
-                meta,
-                columns,
-                stageColumns,
-                report,
-                unresolvedHeaders
-            );
-            records.push(main);
-            for (const { stageId, record } of stageRecords) {
-                const rows = stageRows.get(stageId);
-                if (rows) rows.push(record);
-                else stageRows.set(stageId, [record]);
-            }
+        records.push(main);
+        for (const { stageId, record } of stageRecords) {
+            const rows = stageRows.get(stageId);
+            if (rows) rows.push(record);
+            else stageRows.set(stageId, [record]);
         }
-
-        if (instances.length < opts.pageSize) break;
-        page += 1;
     }
     console.log(`  ${form.key}: ${records.length} records`);
 
-    // One batched rescue for every column that fell back to a raw id, applied before
-    // stageForms are built below so patched labels flow into the child sheets too.
-    await resolveStrayHeaderLabels(api, form.key, unresolvedHeaders, columns, stageColumns, session, report);
+    const sheets = new Map<string, SheetInProgress>([["", { columns, records }]]);
+    for (const [stageId, childColumns] of stageColumns) {
+        sheets.set(stageId, { columns: childColumns, records: stageRows.get(stageId) ?? [] });
+    }
+    await labelOffFormFields(api, session, form.key, offForm, sheets, report);
 
     // Sort by stage id (immutable, DHIS2-assigned) before assigning keys, so the result
     // is independent of stageRows' Map iteration order — which comes from API page/record
@@ -1092,15 +1405,29 @@ async function fetchTracker(
         if (!stage) continue;
 
         const childKey = assignStageChildKey(form.key, stage, usedKeys);
-        const childForm = buildStageChildForm(form, stage, childKey);
+        const childOffForm = offForm.get(stageId);
+        const unordered = stageColumns.get(stageId) ?? new Map<string, string>();
+        reportOffForm(report, childKey, childOffForm, unordered);
+        const childColumns = orderColumns(unordered, meta, childOffForm);
         stageForms.push({
-            form: childForm,
+            form: buildStageChildForm(form, stage, childKey),
             records: rows,
-            columns: finalizeColumns(stageColumns.get(stageId) ?? new Map(), meta),
+            columns: childColumns,
+            valueTypes: columnValueTypes(childColumns, meta, childOffForm),
         });
     }
 
-    return { main: { form, records, columns: finalizeColumns(columns, meta) }, stageForms };
+    reportOffForm(report, form.key, offForm.get(""), columns);
+    const mainColumns = orderColumns(columns, meta, offForm.get(""));
+    return {
+        main: {
+            form,
+            records,
+            columns: mainColumns,
+            valueTypes: columnValueTypes(mainColumns, meta, offForm.get("")),
+        },
+        stageForms,
+    };
 }
 
 async function fetchEvents(
@@ -1111,164 +1438,344 @@ async function fetchEvents(
     session: SessionManager,
     report: IntegrityReport
 ): Promise<FormData> {
-    const records: Record_[] = [];
+    const events = await fetchAllPages(
+        form.key,
+        opts.pageSize,
+        opts.total,
+        page =>
+            opts
+                .requests(() =>
+                    session.retryWithBackoff(() =>
+                        api.tracker.events
+                            .get({
+                                fields: {
+                                    event: true,
+                                    programStage: true,
+                                    orgUnit: true,
+                                    occurredAt: true,
+                                    createdAt: true,
+                                    updatedAt: true,
+                                    status: true,
+                                    dataValues: { dataElement: true, value: true },
+                                },
+                                program: form.uid,
+                                ...ouParams(opts.orgUnit),
+                                order: "createdAt:asc",
+                                page,
+                                pageSize: opts.pageSize,
+                                totalPages: false,
+                            })
+                            .getData()
+                    )
+                )
+                .then(resp => resp.instances ?? []),
+        event => event.event
+    );
+
     const columns = new Map<string, string>();
-    const accept = makePageGuard(form.key);
-    const unresolvedDataElementIds = new Set<string>();
-    let page = 1;
-
-    for (;;) {
-        const currentPage = page;
-        const resp = await session.retryWithBackoff(() =>
-            api.tracker.events
-                .get({
-                    fields: {
-                        event: true,
-                        orgUnit: true,
-                        occurredAt: true,
-                        createdAt: true,
-                        updatedAt: true,
-                        status: true,
-                        dataValues: { dataElement: true, value: true },
-                    },
-                    program: form.uid,
-                    ...ouParams(opts.orgUnit),
-                    page: currentPage,
-                    pageSize: opts.pageSize,
-                    totalPages: false,
-                })
-                .getData()
-        );
-
-        const instances = resp.instances ?? [];
-        if (!accept(instances.map(event => event.event))) break;
-
-        for (const event of instances) {
-            const values = new Map<string, string>();
-            for (const dv of event.dataValues ?? []) {
-                if (dv.value === undefined || dv.value === null) continue;
-                values.set(dv.dataElement, String(dv.value));
-                if (!columns.has(dv.dataElement)) {
-                    const label = meta.dataElements.get(dv.dataElement);
-                    columns.set(dv.dataElement, label ?? dv.dataElement);
-                    if (!label) unresolvedDataElementIds.add(dv.dataElement);
-                }
+    const offForm: OffFormTracker = new Map();
+    const records: Record_[] = events.map(event => {
+        const stage = meta.stageById.get(event.programStage);
+        const values = new Map<string, string>();
+        for (const dv of event.dataValues ?? []) {
+            if (dv.value === undefined || dv.value === null) continue;
+            values.set(dv.dataElement, displayValue(meta, dv.dataElement, String(dv.value)));
+            const label = stage?.dataElementLabels.get(dv.dataElement);
+            if (label === undefined) {
+                noteOffForm(offForm, "", dv.dataElement, {
+                    kind: "dataElement",
+                    id: dv.dataElement,
+                    position: afterStagePosition(stage),
+                    prefix: "",
+                });
             }
-
-            records.push({
-                id: event.event,
-                parentId: form.parentLinkField ? values.get(form.parentLinkField) ?? "" : "",
-                // The Survey form is itself the root: its own id is the survey id.
-                surveyId: form.surveyLinkField ? values.get(form.surveyLinkField) ?? "" : event.event,
-                facilityId: "",
-                orgUnit: event.orgUnit ?? "",
-                label: values.get(PREVALENCE_SURVEY_NAME_DATAELEMENT_ID) ?? event.event,
-                values,
-                meta: new Map<string, string>([
-                    ["occurred_at", event.occurredAt ?? ""],
-                    ["created_at", event.createdAt ?? ""],
-                    ["updated_at", event.updatedAt ?? ""],
-                    ["status", event.status ?? ""],
-                ]),
-            });
+            if (!columns.has(dv.dataElement)) columns.set(dv.dataElement, label ?? dv.dataElement);
         }
 
-        if (instances.length < opts.pageSize) break;
-        page += 1;
-    }
+        return {
+            id: event.event,
+            parentId: form.parentLinkField ? values.get(form.parentLinkField) ?? "" : "",
+            // The Survey form is itself the root: its own id is the survey id.
+            surveyId: form.surveyLinkField ? values.get(form.surveyLinkField) ?? "" : event.event,
+            facilityId: "",
+            orgUnit: event.orgUnit ?? "",
+            label: values.get(PREVALENCE_SURVEY_NAME_DATAELEMENT_ID) ?? event.event,
+            values,
+            meta: new Map<string, string>([
+                ["occurred_at", event.occurredAt ?? ""],
+                ["created_at", event.createdAt ?? ""],
+                ["updated_at", event.updatedAt ?? ""],
+                ["status", event.status ?? ""],
+                ["program", form.serverName],
+            ]),
+            flags: [],
+        };
+    });
     console.log(`  ${form.key}: ${records.length} records`);
 
-    if (unresolvedDataElementIds.size > 0) {
-        const ids = [...unresolvedDataElementIds];
-        const rescued = await fetchDataElementLabels(api, ids, session);
-        for (const id of ids) {
-            const label = rescued.get(id);
-            if (label) columns.set(id, label);
-            else report.unresolvedHeaders.push({ formKey: form.key, id, kind: "dataElement" });
-        }
-        console.warn(
-            `  ! ${form.key}: ${ids.length} column header(s) needed a direct-fetch rescue ` +
-                `(program metadata didn't have the name)`
-        );
-    }
+    await labelOffFormFields(
+        api,
+        session,
+        form.key,
+        offForm,
+        new Map([["", { columns, records }]]),
+        report
+    );
+    reportOffForm(report, form.key, offForm.get(""), columns);
+    const ordered = orderColumns(columns, meta, offForm.get(""));
+    return {
+        form,
+        records,
+        columns: ordered,
+        valueTypes: columnValueTypes(ordered, meta, offForm.get("")),
+    };
+}
 
-    return { form, records, columns: finalizeColumns(columns, meta) };
+/** dataValueSets has no cheap probe, so without explicit dates the whole history is read. */
+const DATASET_DEFAULT_START_DATE = "2000-01-01";
+
+const NUMERIC_VALUE_TYPES = new Set([
+    "NUMBER",
+    "INTEGER",
+    "INTEGER_POSITIVE",
+    "INTEGER_NEGATIVE",
+    "INTEGER_ZERO_OR_POSITIVE",
+    "PERCENTAGE",
+    "UNIT_INTERVAL",
+]);
+
+type NamedRow = { id: string; name: string };
+
+/** Names for everything a dataValue of this dataSet refers to by id. */
+async function fetchDataSetNames(
+    api: D2Api,
+    session: SessionManager,
+    uid: string
+): Promise<{
+    dataElements: Map<string, { label: string; valueType?: string }>;
+    optionCombos: Map<string, string>;
+    /** The dataSet's own attribute option combos (its wards): which values are its own. */
+    attributeOptionCombos: Set<string>;
+}> {
+    const ds = await session.retryWithBackoff(() =>
+        api
+            .get<{
+                categoryCombo?: { categoryOptionCombos?: NamedRow[] };
+                dataSetElements?: {
+                    dataElement: NamedRow & {
+                        formName?: string;
+                        valueType?: string;
+                        categoryCombo?: { categoryOptionCombos?: NamedRow[] };
+                    };
+                }[];
+            }>(`/dataSets/${uid}.json`, {
+                fields:
+                    "categoryCombo[categoryOptionCombos[id,name]]," +
+                    "dataSetElements[dataElement[id,name,formName,valueType,categoryCombo[categoryOptionCombos[id,name]]]]",
+            })
+            .getData()
+    );
+
+    const dataElements = new Map<string, { label: string; valueType?: string }>();
+    const optionCombos = new Map<string, string>();
+    for (const coc of ds.categoryCombo?.categoryOptionCombos ?? [])
+        optionCombos.set(coc.id, coc.name);
+    for (const { dataElement: de } of ds.dataSetElements ?? []) {
+        dataElements.set(de.id, { label: de.formName || de.name, valueType: de.valueType });
+        for (const coc of de.categoryCombo?.categoryOptionCombos ?? [])
+            optionCombos.set(coc.id, coc.name);
+    }
+    const attributeOptionCombos = new Set(
+        (ds.categoryCombo?.categoryOptionCombos ?? []).map(coc => coc.id)
+    );
+    return { dataElements, optionCombos, attributeOptionCombos };
 }
 
 /**
- * Ward Summary Statistics is an aggregate dataSet, not a program: one row per
- * dataValue, keyed by orgUnit + period + attributeOptionCombo (the ward form id).
+ * The ward statistics are aggregate dataSets, not programs: one row per dataValue, keyed by
+ * data element, period, org unit (the facility) and the two option combos. The attribute
+ * option combo identifies the ward (and, for Ward Summary Statistics, the specialty).
+ *
+ * The two ward dataSets share their data elements, and dataValueSets selects by data
+ * element, so each request returns both dataSets' values (verified live: the same 230 values
+ * twice). A value belongs to the dataSet whose attribute combo holds its ward; the others
+ * are left to that dataSet's own sheet and counted in report.otherDataSetValues.
  */
-async function fetchDataSet(api: D2Api, form: ResolvedForm, opts: FetchOpts): Promise<FormData> {
-    if (!opts.orgUnit || !opts.startDate || !opts.endDate) {
-        console.warn(
-            `  ! ${form.key}: skipped (needs --org-unit, --start-date and --end-date; the ` +
-                `dataValueSets endpoint requires an org unit and a period range).`
-        );
-        return { form, records: [], columns: new Map() };
-    }
-
-    const resp = await api.dataValues
-        .getSet({
-            dataSet: [form.uid],
-            orgUnit: [opts.orgUnit],
-            startDate: opts.startDate,
-            endDate: opts.endDate,
-            children: true,
-        })
-        .getData();
-
-    const dataValues = resp.dataValues ?? [];
-    const records: Record_[] = dataValues.map((dv, i: number) => ({
-        id: `${dv.orgUnit}-${dv.period}-${dv.attributeOptionCombo}-${dv.dataElement}-${i}`,
-        parentId: "",
-        // Aggregate data: no survey FK. It links to Facility by org unit, and to a ward
-        // event via attributeOptionCombo (= the ward form id).
-        surveyId: "",
-        facilityId: "",
-        orgUnit: dv.orgUnit ?? "",
-        label: "",
-        values: new Map<string, string>([
-            ["period", String(dv.period ?? "")],
-            ["ward_form_id", String(dv.attributeOptionCombo ?? "")],
-            ["data_element", String(dv.dataElement ?? "")],
-            ["category_option_combo", String(dv.categoryOptionCombo ?? "")],
-            ["value", String(dv.value ?? "")],
-        ]),
-        meta: new Map<string, string>([
-            ["last_updated", dv.lastUpdated ?? ""],
-            ["stored_by", dv.storedBy ?? ""],
-        ]),
-    }));
-
+async function fetchDataSet(
+    api: D2Api,
+    form: ResolvedForm,
+    opts: FetchOpts,
+    session: SessionManager,
+    report: IntegrityReport
+): Promise<FormData> {
+    const orgUnits = opts.orgUnit ? [opts.orgUnit] : opts.dataSetRoots ?? [];
     const columns = new Map<string, string>([
         ["period", "Period"],
-        ["ward_form_id", "Ward form id"],
+        ["ward", "Ward"],
         ["data_element", "Data element"],
-        ["category_option_combo", "Category option combo"],
+        ["disaggregation", "Disaggregation"],
         ["value", "Value"],
     ]);
+    if (orgUnits.length === 0) {
+        console.warn(`  ! ${form.key}: skipped (no org unit to read it under).`);
+        return { form, records: [], columns };
+    }
 
-    console.log(`  ${form.key}: ${records.length} data values`);
-    return { form, records, columns };
+    const [resp, names] = await Promise.all([
+        opts.requests(() =>
+            session.retryWithBackoff(() =>
+                api.dataValues
+                    .getSet({
+                        dataSet: [form.uid],
+                        orgUnit: orgUnits,
+                        startDate: opts.startDate ?? DATASET_DEFAULT_START_DATE,
+                        endDate: opts.endDate ?? new Date().toISOString().slice(0, 10),
+                        children: true,
+                    })
+                    .getData()
+            )
+        ),
+        fetchDataSetNames(api, session, form.uid),
+    ]);
+
+    const nameOf = (id: string | undefined) => (id ? names.optionCombos.get(id) ?? id : "");
+    const dataValues = resp.dataValues ?? [];
+    const own = dataValues.filter(dv =>
+        names.attributeOptionCombos.has(dv.attributeOptionCombo ?? "")
+    );
+    if (own.length < dataValues.length) {
+        report.otherDataSetValues.push({
+            formKey: form.key,
+            count: dataValues.length - own.length,
+        });
+    }
+    const records: Record_[] = own.map(dv => {
+        const coc = nameOf(dv.categoryOptionCombo);
+        return {
+            id: `${dv.dataElement}-${dv.period}-${dv.orgUnit}-${dv.categoryOptionCombo}-${dv.attributeOptionCombo}`,
+            parentId: "",
+            surveyId: "",
+            facilityId: "",
+            orgUnit: dv.orgUnit ?? "",
+            label: "",
+            values: new Map<string, string>([
+                ["period", String(dv.period ?? "")],
+                ["ward", nameOf(dv.attributeOptionCombo)],
+                ["data_element", names.dataElements.get(dv.dataElement)?.label ?? dv.dataElement],
+                ["disaggregation", coc === "default" ? "" : coc],
+                ["value", String(dv.value ?? "")],
+            ]),
+            meta: new Map<string, string>([
+                ["last_updated", dv.lastUpdated ?? ""],
+                ["stored_by", dv.storedBy ?? ""],
+            ]),
+            flags: [],
+        };
+    });
+
+    const allNumeric = [...names.dataElements.values()].every(
+        de => de.valueType !== undefined && NUMERIC_VALUE_TYPES.has(de.valueType)
+    );
+    const others = dataValues.length - own.length;
+    console.log(
+        `  ${form.key}: ${records.length} data values` +
+            (others > 0 ? ` (${others} more belong to the other ward dataSet's wards)` : "")
+    );
+    return { form, records, columns, valueTypes: new Map(allNumeric ? [["value", "NUMBER"]] : []) };
+}
+
+// --- Merging programs ---------------------------------------------------------
+
+const joinUnique = (a: string, b: string) =>
+    a === b ? a : [...new Set([...a.split("; "), ...b.split("; ")])].join("; ");
+
+/**
+ * A form can be backed by several programs: the default plus each custom variant. They share
+ * most data elements, so their rows are stacked into ONE sheet per form key; the `program`
+ * column says which program a row came from. Columns are the union in first-seen order, so
+ * the default program's order leads. Repeatable-stage child sheets merge the same way.
+ */
+export function mergeByFormKey(all: FormData[]): FormData[] {
+    const merged = new Map<string, FormData>();
+
+    for (const data of all) {
+        const prior = merged.get(data.form.key);
+        if (!prior) {
+            merged.set(data.form.key, data);
+            continue;
+        }
+
+        const columns = new Map(prior.columns);
+        for (const [key, label] of data.columns) if (!columns.has(key)) columns.set(key, label);
+
+        merged.set(data.form.key, {
+            form: {
+                ...prior.form,
+                uid: joinUnique(prior.form.uid, data.form.uid),
+                serverName: joinUnique(prior.form.serverName, data.form.serverName),
+                parentLinkField: joinUnique(prior.form.parentLinkField, data.form.parentLinkField),
+                isCustom: prior.form.isCustom || data.form.isCustom,
+            },
+            records: prior.records.concat(data.records),
+            columns,
+            valueTypes: new Map([...(prior.valueTypes ?? []), ...(data.valueTypes ?? [])]),
+        });
+    }
+
+    return [...merged.values()];
+}
+
+/**
+ * Expected record count per sheet key: the discovered totals of the programs actually
+ * extracted for it. A key is absent when any of its programs has no known total (dataSets,
+ * runs without a scope), so reconciliation never compares against a partial number.
+ */
+export function expectedRecordCounts(
+    extracted: ResolvedForm[],
+    totalByUid: Map<string, number | undefined>,
+    discoveries: FormDiscovery[] = []
+): Map<string, number> {
+    const sums = new Map<string, number>();
+    const unknown = new Set<string>();
+
+    for (const form of extracted) {
+        const total = totalByUid.get(form.uid);
+        if (total === undefined) unknown.add(form.key);
+        else sums.set(form.key, (sums.get(form.key) ?? 0) + total);
+    }
+    for (const key of unknown) sums.delete(key);
+
+    // Repeatable-stage sheets: discovery probed their row counts too.
+    const extractedUids = new Set(extracted.map(f => f.uid));
+    for (const d of discoveries) {
+        if (!extractedUids.has(d.form.uid)) continue;
+        for (const s of d.stages) sums.set(s.sheetKey, (sums.get(s.sheetKey) ?? 0) + s.rows);
+    }
+    return sums;
 }
 
 // --- Org unit names ------------------------------------------------------------
 
-async function fetchOrgUnitNames(api: D2Api, ids: string[]): Promise<Map<string, string>> {
+async function fetchOrgUnitNames(
+    api: D2Api,
+    session: SessionManager,
+    ids: string[]
+): Promise<Map<string, string>> {
     const names = new Map<string, string>();
     const chunkSize = 200;
 
     for (let i = 0; i < ids.length; i += chunkSize) {
         const chunk = ids.slice(i, i + chunkSize);
-        const { organisationUnits } = await api.metadata
-            .get({
-                organisationUnits: {
-                    fields: { id: true, name: true },
-                    filter: { id: { in: chunk } },
-                },
-            })
-            .getData();
+        const { organisationUnits } = await session.retryWithBackoff(() =>
+            api.metadata
+                .get({
+                    organisationUnits: {
+                        fields: { id: true, name: true },
+                        filter: { id: { in: chunk } },
+                    },
+                })
+                .getData()
+        );
         for (const ou of organisationUnits) names.set(ou.id, ou.name);
     }
 
@@ -1325,9 +1832,13 @@ export function assignSheetNames(
             let attempt = 0;
             let candidate: string;
             do {
-                const id = attempt === 0 ? shortStableId(source.stableId) : `${shortStableId(source.stableId)}${attempt}`;
+                const id =
+                    attempt === 0
+                        ? shortStableId(source.stableId)
+                        : `${shortStableId(source.stableId)}${attempt}`;
                 const suffix = `~${id}`;
-                candidate = safeLabel.slice(0, Math.max(0, EXCEL_SHEET_NAME_MAX - suffix.length)) + suffix;
+                candidate =
+                    safeLabel.slice(0, Math.max(0, EXCEL_SHEET_NAME_MAX - suffix.length)) + suffix;
                 attempt++;
             } while (used.has(candidate) && attempt < 1000);
             name = candidate;
@@ -1342,34 +1853,54 @@ export function assignSheetNames(
     return result;
 }
 
+/**
+ * Run-level findings for _index and the console. Record-level problems (orphans, test data,
+ * survey mismatches) are not here: they are flags on the records themselves (flagRecords).
+ */
 export type IntegrityReport = {
-    /** Records whose parentId does not resolve to a parent record. */
-    orphans: { formKey: string; recordId: string; missingParentId: string }[];
     /** (survey, orgUnit) pairs matching more than one Facility record. */
     ambiguousFacilities: { surveyId: string; orgUnit: string; facilityIds: string[] }[];
-    /** Records whose own surveyId disagrees with the survey reached via their parent. */
-    surveyMismatches: { formKey: string; recordId: string; own: string; viaParent: string }[];
+    /** Columns of fields no longer on the form, with how many values they hold. */
+    offFormFields: { sheet: string; column: string; values: number }[];
+    /** dataValues a dataSet request returned that belong to another dataSet's wards (see fetchDataSet). */
+    otherDataSetValues: { formKey: string; count: number }[];
     /** Records for which no Facility could be derived. */
     unresolvedFacility: { formKey: string; count: number }[];
     /** Stage events whose programStage id did not resolve in program metadata (data was skipped). */
     unresolvedStageEvents: { formKey: string; programStage: string; count: number }[];
+    /** Extra events (with data) on a single-entry stage: their values overwrote the earlier event's in the shared row. */
+    duplicateStageEvents: { formKey: string; programStage: string; count: number }[];
     /** Sheet names that needed a disambiguation suffix to stay unique. */
     sheetNameCollisions: { key: string; assignedName: string }[];
-    /** Column headers that still show a raw DHIS2 id after every resolution tier ran
-     * (stage config, the program's flat dataElement/attribute list, and a direct fetch). */
-    unresolvedHeaders: { formKey: string; id: string; kind: "dataElement" | "trackedEntityAttribute" }[];
+    /** Off-form fields whose metadata no longer exists at all: the header shows the raw id. */
+    unresolvedHeaders: {
+        formKey: string;
+        id: string;
+        kind: "dataElement" | "trackedEntityAttribute";
+    }[];
 };
 
 export function emptyIntegrityReport(): IntegrityReport {
     return {
-        orphans: [],
         ambiguousFacilities: [],
-        surveyMismatches: [],
+        offFormFields: [],
+        otherDataSetValues: [],
         unresolvedFacility: [],
         unresolvedStageEvents: [],
+        duplicateStageEvents: [],
         sheetNameCollisions: [],
         unresolvedHeaders: [],
     };
+}
+
+function incrementStageCount(
+    counts: IntegrityReport["unresolvedStageEvents"],
+    formKey: string,
+    programStage: string
+): void {
+    const existing = counts.find(u => u.formKey === formKey && u.programStage === programStage);
+    if (existing) existing.count += 1;
+    else counts.push({ formKey, programStage, count: 1 });
 }
 
 /** Records one occurrence of an event whose programStage id did not resolve in metadata. */
@@ -1378,41 +1909,44 @@ export function recordUnresolvedStageEvent(
     formKey: string,
     programStage: string
 ): void {
-    const existing = report.unresolvedStageEvents.find(
-        u => u.formKey === formKey && u.programStage === programStage
-    );
-    if (existing) existing.count += 1;
-    else report.unresolvedStageEvents.push({ formKey, programStage, count: 1 });
+    incrementStageCount(report.unresolvedStageEvents, formKey, programStage);
 }
 
-export function reportIntegrity(report: IntegrityReport): void {
+export function reportIntegrity(report: IntegrityReport, all: FormData[]): void {
     const {
-        orphans,
         ambiguousFacilities,
-        surveyMismatches,
+        offFormFields,
         unresolvedFacility,
         unresolvedStageEvents,
+        duplicateStageEvents,
         sheetNameCollisions,
         unresolvedHeaders,
     } = report;
+    const flagged = summariseFlags(all);
     if (
-        orphans.length === 0 &&
+        flagged.length === 0 &&
         ambiguousFacilities.length === 0 &&
-        surveyMismatches.length === 0 &&
+        offFormFields.length === 0 &&
         unresolvedFacility.length === 0 &&
         unresolvedStageEvents.length === 0 &&
+        duplicateStageEvents.length === 0 &&
         sheetNameCollisions.length === 0 &&
         unresolvedHeaders.length === 0
     ) {
         console.log(
-            "  integrity: no orphans, no ambiguous facilities, no survey mismatches, no skipped events, no unresolved headers."
+            "  integrity: no flagged records, no off-form fields, no skipped or overwritten events."
         );
         return;
     }
 
     console.warn("\n  ! Integrity findings (see the _index sheet for detail):");
-    if (orphans.length > 0) {
-        console.warn(`      orphans (parent id not found): ${orphans.length}`);
+    for (const f of flagged)
+        console.warn(`      ${f.sheet}: ${f.count} record(s) flagged ${f.flag}`);
+    if (offFormFields.length > 0) {
+        const values = offFormFields.reduce((sum, f) => sum + f.values, 0);
+        console.warn(
+            `      ${offFormFields.length} column(s) of fields no longer on the form, ${values} value(s) kept`
+        );
     }
     if (unresolvedFacility.length > 0) {
         for (const u of unresolvedFacility) {
@@ -1424,11 +1958,6 @@ export function reportIntegrity(report: IntegrityReport): void {
             `      ambiguous facilities ((survey, orgUnit) matching >1 Facility): ${ambiguousFacilities.length}`
         );
     }
-    if (surveyMismatches.length > 0) {
-        console.warn(
-            `      survey mismatches (own Survey_id != Survey via parent): ${surveyMismatches.length}`
-        );
-    }
     if (unresolvedStageEvents.length > 0) {
         for (const u of unresolvedStageEvents) {
             console.warn(
@@ -1436,12 +1965,18 @@ export function reportIntegrity(report: IntegrityReport): void {
             );
         }
     }
+    for (const u of duplicateStageEvents) {
+        console.warn(
+            `      ${u.formKey}: ${u.count} extra event(s) on single-entry stage ${u.programStage}; ` +
+                `their values overwrote the earlier event's`
+        );
+    }
     if (sheetNameCollisions.length > 0) {
         console.warn(`      sheet name collisions resolved: ${sheetNameCollisions.length}`);
     }
     if (unresolvedHeaders.length > 0) {
         console.warn(
-            `      unresolved column headers (raw id shown, name not found anywhere): ${unresolvedHeaders.length}`
+            `      fields deleted from DHIS2 metadata (header shows the raw id): ${unresolvedHeaders.length}`
         );
         for (const h of unresolvedHeaders) {
             console.warn(`        ${h.formKey}: ${h.kind} ${h.id}`);
@@ -1496,39 +2031,254 @@ export function resolveFacilityIds(
             if (matches && matches[0]) record.facilityId = matches[0];
             else unresolved++;
         }
-        if (unresolved > 0) report.unresolvedFacility.push({ formKey: data.form.key, count: unresolved });
+        if (unresolved > 0)
+            report.unresolvedFacility.push({ formKey: data.form.key, count: unresolved });
     }
 }
 
+/** What DHIS2 says about an id that records point at but this extract does not contain. */
+export type ReferenceStatus =
+    | { status: "deleted"; lastUpdated: string }
+    /** Exists and is not deleted, under `orgUnit` (a display name). */
+    | { status: "elsewhere"; orgUnit: string };
+
+/** Looks up ids in DHIS2; an id missing from the result does not exist there. */
+export type ReferenceLookup = (ids: {
+    surveys: string[];
+    trackedEntities: string[];
+}) => Promise<Map<string, ReferenceStatus>>;
+
+const isUid = (id: string) => UID_RE.test(id);
+
+function referenceFlag(
+    what: string,
+    id: string,
+    status: ReferenceStatus | undefined,
+    isSurvey: boolean
+): RecordFlag {
+    if (status?.status === "deleted") {
+        return {
+            flag: "PARENT DELETED",
+            detail: `${what} ${id} was deleted in DHIS2 (last changed ${status.lastUpdated.slice(
+                0,
+                10
+            )})`,
+        };
+    }
+    if (status?.status === "elsewhere") {
+        return {
+            flag: "OUTSIDE EXTRACT",
+            detail: `${what} ${id} exists in DHIS2 under ${status.orgUnit}, outside this extract`,
+        };
+    }
+    return isSurvey
+        ? { flag: "TEST/INVALID", detail: `Survey_id "${id}" is not a survey in DHIS2` }
+        : { flag: "PARENT MISSING", detail: `${what} "${id}" does not exist in DHIS2` };
+}
+
+function addFlag(record: Record_, flag: RecordFlag): void {
+    if (!record.flags.some(f => f.flag === flag.flag && f.detail === flag.detail))
+        record.flags.push(flag);
+}
+
 /**
- * Cross-check: a leaf's own Survey id (from its own TEA) against the Survey reached by
- * walking parent -> Case report -> Survey. Disagreement indicates a data integrity problem
- * server-side; we report it rather than silently trusting one side.
+ * Flags the records epidemiologists should look at twice: test or invalid survey ids,
+ * records whose parent was deleted in DHIS2 (children are not deleted with it), parents that
+ * never existed or sit outside the extract, survey mismatches, and records whose parent is
+ * itself flagged. Every dangling id is looked up in one batch, so "deleted" is told apart
+ * from "never existed". Parents are flagged before their children, so flags propagate down.
+ *
+ * The Survey_id check needs the Survey form in the run (without it every id would look
+ * unknown); a parent link is checked only when the parent form was extracted.
  */
-export function crossCheckSurveyIds(
+export async function flagRecords(
     all: FormData[],
     recordIndex: Map<string, Map<string, Record_>>,
-    report: IntegrityReport
-): void {
-    for (const data of all) {
-        if (!data.form.parentKey || data.form.kind === "dataSet") continue;
+    lookUp: ReferenceLookup
+): Promise<void> {
+    const byKey = new Map(all.map(d => [d.form.key, d]));
+    const survey = all.find(d => d.form.defaultUid === PREVALENCE_SURVEY_FORM_ID);
+    const surveys = survey && recordIndex.get(survey.form.key);
+    const depth = (data: FormData): number => {
+        const parent = data.form.parentKey ? byKey.get(data.form.parentKey) : undefined;
+        return parent && parent !== data ? 1 + depth(parent) : 0;
+    };
 
+    const checks = all
+        .filter(data => data.form.kind !== "dataSet" && data !== survey)
+        .map(data => {
+            const parent = data.form.parentKey ? byKey.get(data.form.parentKey) : undefined;
+            return {
+                data,
+                // A repeatable-stage row carries its owner's Survey_id; the owner's check covers it.
+                checkSurvey: !!surveys && data.form.kind !== "trackerStage",
+                // Where the parent IS the Survey, the Survey_id check already covers the link.
+                parent: parent && parent !== survey ? parent : undefined,
+            };
+        })
+        .sort((a, b) => depth(a.data) - depth(b.data));
+
+    const danglingSurveys = new Set<string>();
+    const danglingParents = new Set<string>();
+    for (const { data, checkSurvey, parent } of checks) {
+        const parents = parent && recordIndex.get(parent.form.key);
         for (const record of data.records) {
-            if (!record.surveyId || !record.parentId) continue;
-            const parent = recordIndex.get(data.form.parentKey)?.get(record.parentId);
-            if (!parent) continue;
+            if (checkSurvey && record.surveyId && !surveys?.has(record.surveyId)) {
+                danglingSurveys.add(record.surveyId);
+            }
+            if (parents && record.parentId && !parents.has(record.parentId))
+                danglingParents.add(record.parentId);
+        }
+    }
+    const statuses =
+        danglingSurveys.size + danglingParents.size > 0
+            ? await lookUp({
+                  surveys: [...danglingSurveys].filter(isUid),
+                  trackedEntities: [...danglingParents].filter(isUid),
+              })
+            : new Map<string, ReferenceStatus>();
 
-            const viaParent = parent.surveyId || parent.id;
-            if (viaParent && record.surveyId !== viaParent) {
-                report.surveyMismatches.push({
-                    formKey: data.form.key,
-                    recordId: record.id,
-                    own: record.surveyId,
-                    viaParent,
-                });
+    for (const { data, checkSurvey, parent } of checks) {
+        const parents = parent && recordIndex.get(parent.form.key);
+        for (const record of data.records) {
+            if (checkSurvey) {
+                if (!record.surveyId)
+                    addFlag(record, { flag: "TEST/INVALID", detail: "No Survey_id recorded" });
+                else if (!surveys?.has(record.surveyId)) {
+                    addFlag(
+                        record,
+                        referenceFlag(
+                            "Survey",
+                            record.surveyId,
+                            statuses.get(record.surveyId),
+                            true
+                        )
+                    );
+                }
+            }
+            if (!parent || !parents) continue;
+
+            const parentKey = parent.form.key;
+            const parentRecord = record.parentId ? parents.get(record.parentId) : undefined;
+            if (!record.parentId) {
+                addFlag(record, { flag: "PARENT MISSING", detail: `No ${parentKey} id recorded` });
+            } else if (!parentRecord) {
+                addFlag(
+                    record,
+                    referenceFlag(parentKey, record.parentId, statuses.get(record.parentId), false)
+                );
+            } else {
+                if (
+                    data.form.kind !== "trackerStage" &&
+                    record.surveyId &&
+                    parentRecord.surveyId &&
+                    record.surveyId !== parentRecord.surveyId
+                ) {
+                    addFlag(record, {
+                        flag: "SURVEY MISMATCH",
+                        detail: `Survey_id ${record.surveyId}, but its ${parentKey} ${parentRecord.id} has ${parentRecord.surveyId}`,
+                    });
+                }
+                if (parentRecord.flags.length > 0) {
+                    const kinds = [...new Set(parentRecord.flags.map(f => f.flag))].join(", ");
+                    addFlag(record, {
+                        flag: "PARENT FLAGGED",
+                        detail: `${parentKey} ${parentRecord.id} is flagged: ${kinds}`,
+                    });
+                }
             }
         }
     }
+}
+
+/** Flagged-record counts per sheet and flag, for _index and the console. */
+export function summariseFlags(
+    all: FormData[]
+): { sheet: string; flag: FlagKind; count: number }[] {
+    const counts = new Map<string, { sheet: string; flag: FlagKind; count: number }>();
+    for (const data of all) {
+        for (const record of data.records) {
+            for (const flag of new Set(record.flags.map(f => f.flag))) {
+                const key = `${data.form.key}|${flag}`;
+                const row = counts.get(key) ?? { sheet: data.form.key, flag, count: 0 };
+                row.count++;
+                counts.set(key, row);
+            }
+        }
+    }
+    return [...counts.values()];
+}
+
+/** Ids per tracker lookup request. */
+const LOOKUP_BATCH = 50;
+
+/**
+ * Asks DHIS2 about ids records point at but the extract does not contain, deleted records
+ * included, so the flags can say "deleted" rather than just "missing".
+ */
+async function lookUpReferences(
+    api: D2Api,
+    session: SessionManager,
+    ids: { surveys: string[]; trackedEntities: string[] }
+): Promise<Map<string, ReferenceStatus>> {
+    type Row = { deleted?: boolean; orgUnit?: string; updatedAt?: string };
+    const found = new Map<string, Row>();
+
+    const query = async (
+        path: string,
+        idParam: string,
+        idField: "event" | "trackedEntity",
+        list: string[]
+    ) => {
+        for (let i = 0; i < list.length; i += LOOKUP_BATCH) {
+            const batch = list.slice(i, i + LOOKUP_BATCH);
+            const resp = await session.retryWithBackoff(() =>
+                api
+                    .get<{
+                        [key: string]:
+                            | (Row & { event?: string; trackedEntity?: string })[]
+                            | undefined;
+                    }>(path, {
+                        [idParam]: batch.join(","),
+                        includeDeleted: true,
+                        ouMode: "ACCESSIBLE",
+                        fields: `${idField},deleted,orgUnit,updatedAt`,
+                        pageSize: batch.length,
+                    })
+                    .getData()
+            );
+            for (const row of resp[idParam] ?? resp.instances ?? []) {
+                const id = row[idField];
+                if (id) found.set(id, row);
+            }
+        }
+    };
+    await query("/tracker/events", "events", "event", ids.surveys);
+    await query(
+        "/tracker/trackedEntities",
+        "trackedEntities",
+        "trackedEntity",
+        ids.trackedEntities
+    );
+
+    const elsewhere = [...found.values()]
+        .filter(r => !r.deleted && r.orgUnit)
+        .map(r => r.orgUnit as string);
+    const names = await fetchOrgUnitNames(api, session, [...new Set(elsewhere)]);
+
+    const statuses = new Map<string, ReferenceStatus>();
+    for (const [id, row] of found) {
+        statuses.set(
+            id,
+            row.deleted
+                ? { status: "deleted", lastUpdated: row.updatedAt ?? "" }
+                : {
+                      status: "elsewhere",
+                      orgUnit: names.get(row.orgUnit ?? "") ?? row.orgUnit ?? "?",
+                  }
+        );
+    }
+    return statuses;
 }
 
 /**
@@ -1540,8 +2290,7 @@ export function buildBreadcrumb(
     form: ResolvedForm,
     record: Record_,
     byKey: Map<string, FormData>,
-    recordIndex: Map<string, Map<string, Record_>>,
-    report?: IntegrityReport
+    recordIndex: Map<string, Map<string, Record_>>
 ): string {
     const parts: string[] = [];
 
@@ -1561,13 +2310,6 @@ export function buildBreadcrumb(
             .get(currentForm.parentKey)
             ?.get(parentId);
 
-        if (!parentRecord && report && currentRecord === record) {
-            report.orphans.push({
-                formKey: form.key,
-                recordId: record.id,
-                missingParentId: parentId,
-            });
-        }
         parts.unshift(parentRecord?.label || parentId);
 
         currentForm = parentData.form;
@@ -1611,35 +2353,98 @@ export function keyColumnsFor(form: ResolvedForm, byKey: Map<string, FormData>):
     return cols;
 }
 
+/** Beyond 15 significant digits Excel silently rounds a number, so such values stay text. */
+const EXCEL_MAX_DIGITS = 15;
+
+/**
+ * A stored value as an Excel cell: a real number or date for numeric/date fields, so they
+ * can be summed and filtered, and the text unchanged for everything else (UIDs and coded
+ * values must never be re-parsed). A value that does not convert exactly stays text.
+ */
+export function toCellValue(raw: string, valueType: string | undefined): string | number | Date {
+    if (raw === "" || !valueType) return raw;
+
+    if (NUMERIC_VALUE_TYPES.has(valueType)) {
+        const n = Number(raw);
+        const digits = raw.replace(/[^0-9]/g, "").replace(/^0+/, "").length;
+        return Number.isFinite(n) && digits <= EXCEL_MAX_DIGITS ? n : raw;
+    }
+    if (valueType === "DATE" || valueType === "DATETIME") {
+        // DHIS2 dates carry no zone. Read them as UTC, which is how Excel serials are
+        // written, so the cell shows exactly the stored date/time.
+        const hasZone = /(Z|[+-]\d\d:?\d\d)$/i.test(raw);
+        const iso =
+            valueType === "DATE" ? `${raw.slice(0, 10)}T00:00:00Z` : hasZone ? raw : `${raw}Z`;
+        const date = new Date(iso);
+        return Number.isNaN(date.getTime()) ? raw : date;
+    }
+    return raw;
+}
+
+function columnNumFmt(valueType: string | undefined): string {
+    if (valueType === "DATE") return "yyyy-mm-dd";
+    if (valueType === "DATETIME") return "yyyy-mm-dd hh:mm";
+    return valueType && NUMERIC_VALUE_TYPES.has(valueType) ? "General" : "@";
+}
+
+/** Meta columns holding DHIS2 timestamps, written as real date-times. */
+const META_DATETIME_KEYS = new Set([
+    "created_at",
+    "updated_at",
+    "enrolled_at",
+    "occurred_at",
+    "last_updated",
+]);
+
+/** Light orange: flagged rows stand out without hiding their content. */
+const FLAG_FILL: Excel.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFD8A8" } };
+
+type Writer = Excel.stream.xlsx.WorkbookWriter;
+
+/**
+ * Streams one form sheet. Flag columns come first, so a flagged row is the first thing an
+ * epidemiologist sees on it; flagged rows are also shaded, and the header has filters.
+ */
 export function writeFormSheet(
-    workbook: Excel.Workbook,
+    workbook: Writer,
     data: FormData,
     byKey: Map<string, FormData>,
     recordIndex: Map<string, Map<string, Record_>>,
     orgUnitNames: Map<string, string>,
-    sheetName: string,
-    report?: IntegrityReport
+    sheetName: string
 ): void {
-    const { form, records, columns } = data;
-    const sheet = workbook.addWorksheet(sheetName);
-
+    const { form, records } = data;
+    const columns = uniqueLabels(data.columns);
+    const columnUids = [...columns.keys()];
     const keyColumns = keyColumnsFor(form, byKey);
     const metaKeys = [...new Set(records.flatMap(r => [...r.meta.keys()]))];
 
-    const header = [
+    const leading = [
+        "flag",
+        "flag_detail",
         ...keyColumns.map(c => c.header),
         "path",
         "record_id",
         "org_unit_id",
         "org_unit_name",
-        ...metaKeys,
-        ...[...columns.values()],
     ];
-    sheet.addRow(header);
-    sheet.getRow(1).font = { bold: true };
-    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    const header = [...leading, ...metaKeys, ...columns.values()];
+    // One valueType per column: identifiers and codes stay text; timestamps and typed fields don't.
+    const types = [
+        ...leading.map(() => undefined),
+        ...metaKeys.map(k => (META_DATETIME_KEYS.has(k) ? "DATETIME" : undefined)),
+        ...columnUids.map(uid => data.valueTypes?.get(uid)),
+    ];
 
-    const columnUids = [...columns.keys()];
+    const sheet = workbook.addWorksheet(sheetName, { views: [{ state: "frozen", ySplit: 1 }] });
+    // Streaming writes columns with the first row, so formats are set first, at column level.
+    // Text by default, so DHIS2 UIDs and coded values are never re-parsed by Excel as numbers
+    // or dates if the sheet is edited.
+    sheet.columns = types.map(type => ({ width: 18, style: { numFmt: columnNumFmt(type) } }));
+    sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: header.length } };
+    const headerRow = sheet.addRow(header);
+    headerRow.font = { bold: true };
+    headerRow.commit();
 
     if (records.length + 1 > EXCEL_MAX_ROWS) {
         console.warn(
@@ -1650,27 +2455,28 @@ export function writeFormSheet(
     }
 
     for (const record of records.slice(0, EXCEL_MAX_ROWS - 1)) {
-        const breadcrumb = buildBreadcrumb(form, record, byKey, recordIndex, report);
-
-        const row = [
+        const values = [
+            [...new Set(record.flags.map(f => f.flag))].join("; "),
+            record.flags.map(f => f.detail).join("; "),
             ...keyColumns.map(c => c.get(record)),
-            breadcrumb,
+            buildBreadcrumb(form, record, byKey, recordIndex),
             record.id,
             record.orgUnit,
             orgUnitNames.get(record.orgUnit) ?? "",
             ...metaKeys.map(k => record.meta.get(k) ?? ""),
             ...columnUids.map(uid => record.values.get(uid) ?? ""),
         ];
-        sheet.addRow(row);
+        // An empty value writes no cell at all: a truly blank cell, and a smaller file.
+        const row = sheet.addRow(
+            values.map((value, i) => (value === "" ? null : toCellValue(value, types[i])))
+        );
+        if (record.flags.length > 0) {
+            for (let column = 1; column <= header.length; column++)
+                row.getCell(column).fill = FLAG_FILL;
+        }
+        row.commit();
     }
-
-    // Format as text at column level (one style record per column rather than
-    // per cell) so DHIS2 UIDs and coded values are never re-parsed by Excel as
-    // numbers or dates if the sheet is edited.
-    sheet.columns.forEach(column => {
-        column.width = 18;
-        column.numFmt = "@";
-    });
+    sheet.commit();
 }
 
 /**
@@ -1679,15 +2485,15 @@ export function writeFormSheet(
  * SQL loaders) can read this sheet instead of hard-coding the model.
  */
 export function writeRelationshipsSheet(
-    workbook: Excel.Workbook,
+    workbook: Writer,
     all: FormData[],
     facilityKey: string | undefined
 ): void {
     const sheet = workbook.addWorksheet("_relationships");
+    [20, 14, 16, 16, 42, 34, 24, 52].forEach((width, i) => (sheet.getColumn(i + 1).width = width));
     const byKey = new Map(all.map(d => [d.form.key, d]));
 
-    sheet.addRow(["Relationship specification"]);
-    sheet.getRow(1).font = { bold: true, size: 14 };
+    sheet.addRow(["Relationship specification"]).font = { bold: true, size: 14 };
     sheet.addRow([
         "Note",
         "Case report has NO foreign key to Facility: it links to Survey. Facility_id is DERIVED " +
@@ -1695,7 +2501,7 @@ export function writeRelationshipsSheet(
     ]);
     sheet.addRow([]);
 
-    const header = sheet.addRow([
+    sheet.addRow([
         "sheet",
         "primary_key",
         "parent_sheet",
@@ -1704,8 +2510,7 @@ export function writeRelationshipsSheet(
         "cardinality",
         "source_field",
         "example_join",
-    ]);
-    header.font = { bold: true };
+    ]).font = { bold: true };
 
     for (const { form } of all) {
         const keyCols = keyColumnsFor(form, byKey);
@@ -1719,11 +2524,12 @@ export function writeRelationshipsSheet(
 
         if (form.kind === "dataSet") {
             parentKeyCol = "(none)";
-            cardinality = "aggregate: 1 row per dataElement x coc x period x orgUnit";
+            cardinality =
+                "aggregate: 1 row per data element x disaggregation x period x org unit x ward";
             exampleJoin = facilityKey
                 ? `${form.key}.org_unit_id = ${facilityKey}.org_unit_id`
                 : "org_unit_id = <facility org unit>";
-            sourceField = "attributeOptionCombo = ward form id";
+            sourceField = "Ward = the dataValue's attribute option combo";
         } else if (isSurvey) {
             parentKeyCol = "(root)";
             cardinality = "root";
@@ -1731,9 +2537,10 @@ export function writeRelationshipsSheet(
             sourceField = "-";
         } else if (parentForm) {
             const isFacility = form.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID;
-            parentKeyCol = isFacility || parentForm.defaultUid === PREVALENCE_SURVEY_FORM_ID
-                ? "Survey_id"
-                : `${parentForm.key}_id`;
+            parentKeyCol =
+                isFacility || parentForm.defaultUid === PREVALENCE_SURVEY_FORM_ID
+                    ? "Survey_id"
+                    : `${parentForm.key}_id`;
             cardinality = `${parentForm.key} 1 -> N ${form.key}`;
             exampleJoin = `${form.key}.${parentKeyCol} = ${parentForm.key}.record_id`;
         }
@@ -1751,8 +2558,7 @@ export function writeRelationshipsSheet(
     }
 
     sheet.addRow([]);
-    const derivedHeader = sheet.addRow(["Derived key", "Rule"]);
-    derivedHeader.font = { bold: true };
+    sheet.addRow(["Derived key", "Rule"]).font = { bold: true };
     sheet.addRow([
         "Facility_id",
         facilityKey
@@ -1763,19 +2569,11 @@ export function writeRelationshipsSheet(
         "Survey_id",
         "Read directly from each record's own survey-link attribute — every record traces to its Survey without walking the chain.",
     ]);
-
-    sheet.getColumn(1).width = 20;
-    sheet.getColumn(2).width = 14;
-    sheet.getColumn(3).width = 16;
-    sheet.getColumn(4).width = 16;
-    sheet.getColumn(5).width = 42;
-    sheet.getColumn(6).width = 34;
-    sheet.getColumn(7).width = 24;
-    sheet.getColumn(8).width = 52;
+    sheet.commit();
 }
 
 export function writeIndexSheet(
-    workbook: Excel.Workbook,
+    workbook: Writer,
     all: FormData[],
     unresolved: { spec: FormSpec; reason: string }[],
     baseUrl: string,
@@ -1787,23 +2585,34 @@ export function writeIndexSheet(
     }
 ): void {
     const sheet = workbook.addWorksheet("_index");
+    [34, 62, 14, 14, 14, 14, 14, 14, 14, 14, 14].forEach(
+        (width, i) => (sheet.getColumn(i + 1).width = width)
+    );
     const byKey = new Map(all.map(d => [d.form.key, d]));
+    const heading = (cells: (string | number)[]) => (sheet.addRow(cells).font = { bold: true });
 
-    sheet.addRow(["AMR Surveys extraction"]);
-    sheet.getRow(1).font = { bold: true, size: 14 };
+    sheet.addRow(["AMR Surveys extraction"]).font = { bold: true, size: 14 };
     sheet.addRow(["Server", baseUrl]);
     sheet.addRow(["Extracted at", new Date().toISOString()]);
     if (extra?.country) {
         const c = extra.country;
-        sheet.addRow(["Country", `${c.name}${c.code ? ` (${c.code})` : ""} uid=${c.id} level=${c.level}`]);
+        sheet.addRow([
+            "Country",
+            `${c.name}${c.code ? ` (${c.code})` : ""} uid=${c.id} level=${c.level}`,
+        ]);
     }
     sheet.addRow([
         "Note",
         "Read-only extraction. One sheet per form; join on the *_id columns. See _relationships.",
     ]);
+    sheet.addRow([
+        "Flags",
+        "Rows needing a second look are shaded orange and say why in the 'flag' and 'flag_detail' " +
+            "columns (columns A-B of every sheet); filter column A to include or exclude them.",
+    ]);
     sheet.addRow([]);
 
-    const headerRow = sheet.addRow([
+    heading([
         "Sheet",
         "Form name (server)",
         "UID",
@@ -1812,13 +2621,12 @@ export function writeIndexSheet(
         "Parent sheet",
         "Parent link field",
         "Records",
+        "Flagged",
         "Expected",
         "Reconciled",
     ]);
-    headerRow.font = { bold: true };
 
     const expectedByKey = new Map((extra?.reconciliation ?? []).map(r => [r.formKey, r.expected]));
-
     for (const { form, records } of all) {
         const expected = expectedByKey.get(form.key);
         const reconciled =
@@ -1832,51 +2640,80 @@ export function writeIndexSheet(
             form.parentKey ?? "(root)",
             form.parentLinkField || "(none)",
             records.length,
+            records.filter(r => r.flags.length > 0).length,
             expected ?? "n/a",
             reconciled,
         ]);
     }
 
     sheet.addRow([]);
-    const treeHeader = sheet.addRow(["Hierarchy (child counts)"]);
-    treeHeader.font = { bold: true };
-
-    const roots = all.filter(d => !d.form.parentKey);
+    heading(["Hierarchy (child counts)"]);
     const renderTree = (data: FormData, depth: number) => {
-        sheet.addRow([`${"    ".repeat(depth)}${depth > 0 ? "└─ " : ""}${data.form.key}`, data.records.length]);
-        for (const child of all.filter(d => d.form.parentKey === data.form.key)) {
+        sheet.addRow([
+            `${"    ".repeat(depth)}${depth > 0 ? "└─ " : ""}${data.form.key}`,
+            data.records.length,
+        ]);
+        for (const child of all.filter(d => d.form.parentKey === data.form.key))
             renderTree(child, depth + 1);
-        }
     };
-    for (const root of roots) renderTree(root, 0);
-    for (const orphan of all.filter(d => d.form.parentKey && !byKey.has(d.form.parentKey))) {
-        renderTree(orphan, 0);
+    for (const root of all.filter(d => !d.form.parentKey)) renderTree(root, 0);
+    for (const detached of all.filter(d => d.form.parentKey && !byKey.has(d.form.parentKey))) {
+        renderTree(detached, 0);
     }
 
     if (unresolved.length > 0) {
         sheet.addRow([]);
-        const uHeader = sheet.addRow(["Not extracted", "Reason"]);
-        uHeader.font = { bold: true };
-        for (const { spec, reason } of unresolved) {
-            sheet.addRow([spec.requestedName, reason]);
-        }
+        heading(["Not extracted", "Reason"]);
+        for (const { spec, reason } of unresolved) sheet.addRow([spec.requestedName, reason]);
     }
+
+    const flagged = summariseFlags(all);
+    sheet.addRow([]);
+    heading(["Flagged records", "Flag", "Records"]);
+    if (flagged.length === 0) sheet.addRow(["none"]);
+    for (const f of flagged) sheet.addRow([f.sheet, f.flag, f.count]);
+    sheet.addRow([]);
+    heading(["Flag", "Meaning"]);
+    for (const [flag, meaning] of Object.entries(FLAG_MEANINGS)) sheet.addRow([flag, meaning]);
 
     const integrity = extra?.integrity;
     if (integrity) {
-        sheet.addRow([]);
-        const iHeader = sheet.addRow(["Integrity findings", "Detail"]);
-        iHeader.font = { bold: true };
+        if (integrity.offFormFields.length > 0) {
+            // A field can be off-form in two programs merged into one sheet: one row per column.
+            const byColumn = new Map<string, { sheet: string; column: string; values: number }>();
+            for (const f of integrity.offFormFields) {
+                const key = `${f.sheet}|${f.column}`;
+                const row = byColumn.get(key) ?? { ...f, values: 0 };
+                row.values += f.values;
+                byColumn.set(key, row);
+            }
+            sheet.addRow([]);
+            heading([
+                "Fields no longer on the form",
+                "Column (marked [not on current form])",
+                "Values",
+            ]);
+            sheet.addRow([
+                "",
+                "Data entered in fields since removed from the form. The app no longer shows them; " +
+                    "this extract keeps them. Headers use the field's full DHIS2 name.",
+            ]);
+            const sheetOrder = new Map(all.map((d, i) => [d.form.key, i]));
+            const rows = [...byColumn.values()].sort(
+                (a, b) =>
+                    (sheetOrder.get(a.sheet) ?? 0) - (sheetOrder.get(b.sheet) ?? 0) ||
+                    a.column.localeCompare(b.column, undefined, { numeric: true })
+            );
+            for (const f of rows) sheet.addRow([f.sheet, f.column, f.values]);
+        }
 
         const findings: [string, string][] = [];
-        for (const o of integrity.orphans.slice(0, 200)) {
+        for (const o of integrity.otherDataSetValues) {
             findings.push([
-                `orphan: ${o.formKey}`,
-                `record ${o.recordId} references missing parent ${o.missingParentId}`,
+                `other dataSet's values: ${o.formKey}`,
+                `${o.count} value(s) returned for this dataSet belong to another dataSet's wards (the ward ` +
+                    `dataSets share data elements); they are on that dataSet's sheet, not this one`,
             ]);
-        }
-        if (integrity.orphans.length > 200) {
-            findings.push(["orphan: ...", `${integrity.orphans.length - 200} more not listed`]);
         }
         for (const u of integrity.unresolvedFacility) {
             findings.push([
@@ -1887,19 +2724,21 @@ export function writeIndexSheet(
         for (const a of integrity.ambiguousFacilities.slice(0, 50)) {
             findings.push([
                 "ambiguous facility",
-                `survey ${a.surveyId} + orgUnit ${a.orgUnit} matches ${a.facilityIds.length}: ${a.facilityIds.join(", ")}`,
-            ]);
-        }
-        for (const m of integrity.surveyMismatches.slice(0, 50)) {
-            findings.push([
-                `survey mismatch: ${m.formKey}`,
-                `record ${m.recordId} own Survey_id=${m.own} but via parent=${m.viaParent}`,
+                `survey ${a.surveyId} + orgUnit ${a.orgUnit} matches ${
+                    a.facilityIds.length
+                }: ${a.facilityIds.join(", ")}`,
             ]);
         }
         for (const u of integrity.unresolvedStageEvents) {
             findings.push([
                 `SKIPPED events: ${u.formKey}`,
                 `${u.count} event(s) referenced unresolvable program stage ${u.programStage} — their data was NOT extracted`,
+            ]);
+        }
+        for (const d of integrity.duplicateStageEvents) {
+            findings.push([
+                `duplicate stage events: ${d.formKey}`,
+                `${d.count} extra event(s) on single-entry stage ${d.programStage} — the last event's values overwrote the earlier ones in the shared row`,
             ]);
         }
         for (const c of integrity.sheetNameCollisions) {
@@ -1910,20 +2749,17 @@ export function writeIndexSheet(
         }
         for (const h of integrity.unresolvedHeaders) {
             findings.push([
-                `unresolved header: ${h.formKey}`,
-                `${h.kind} ${h.id} — its name was not found in the stage config, the program's ` +
-                    `metadata, or a direct lookup; the column header shows the raw id`,
+                `deleted field: ${h.formKey}`,
+                `${h.kind} ${h.id} holds values but no longer exists in DHIS2 metadata; the header shows its id`,
             ]);
         }
 
-        if (findings.length === 0) sheet.addRow(["none", "No orphans, ambiguous facilities or survey mismatches."]);
-        else for (const f of findings) sheet.addRow(f);
+        sheet.addRow([]);
+        heading(["Other findings", "Detail"]);
+        if (findings.length === 0) sheet.addRow(["none"]);
+        for (const f of findings) sheet.addRow(f);
     }
-
-    sheet.getColumn(1).width = 34;
-    sheet.getColumn(2).width = 62;
-    sheet.getColumn(3).width = 14;
-    for (let i = 4; i <= 10; i++) sheet.getColumn(i).width = 14;
+    sheet.commit();
 }
 
 // --- Country resolution & discovery -------------------------------------------
@@ -1937,14 +2773,48 @@ export type ResolvedCountry = {
 };
 
 const UID_RE = /^[A-Za-z][A-Za-z0-9]{10}$/;
+const COUNTRY_FIELDS = { id: true, name: true, code: true, level: true } as const;
+
+/**
+ * Every record traces to a Survey, and a Survey's org unit is its country, so the Survey
+ * form's org units are the countries that have data.
+ */
+async function countriesWithData(
+    api: D2Api,
+    session: SessionManager,
+    forms: ResolvedForm[]
+): Promise<ResolvedCountry[]> {
+    const survey = forms.find(f => f.defaultUid === PREVALENCE_SURVEY_FORM_ID);
+    if (!survey)
+        throw new Error("--per-country needs the Survey form, which could not be resolved.");
+
+    const meta = await fetchProgramMeta(api, session, survey.uid);
+    const opts: FetchOpts = { pageSize: 500, requests: createLimiter(REQUEST_CONCURRENCY) };
+    const { records } = await fetchEvents(api, survey, meta, opts, session, emptyIntegrityReport());
+    const ids = [...new Set(records.map(r => r.orgUnit).filter(Boolean))];
+    if (ids.length === 0)
+        throw new Error("--per-country found no Survey records to take countries from.");
+
+    const { organisationUnits } = await session.retryWithBackoff(() =>
+        api.metadata
+            .get({ organisationUnits: { fields: COUNTRY_FIELDS, filter: { id: { in: ids } } } })
+            .getData()
+    );
+    return organisationUnits
+        .map(ou => ({ ...ou, matchedBy: "survey" }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+}
 
 /**
  * Resolves --country by code (e.g. KEN), then exact name, then UID. Fails loudly and lists
  * candidates on ambiguity rather than silently picking one.
  */
-export async function resolveCountry(api: D2Api, input: string): Promise<ResolvedCountry> {
+export async function resolveCountry(
+    api: D2Api,
+    session: SessionManager,
+    input: string
+): Promise<ResolvedCountry> {
     const term = input.trim();
-    const fields = { id: true, name: true, code: true, level: true } as const;
 
     const attempts = [
         { matchedBy: "code", filter: { code: { eq: term.toUpperCase() } } },
@@ -1953,9 +2823,11 @@ export async function resolveCountry(api: D2Api, input: string): Promise<Resolve
     ];
 
     for (const attempt of attempts) {
-        const { organisationUnits } = await api.metadata
-            .get({ organisationUnits: { fields, filter: attempt.filter } })
-            .getData();
+        const { organisationUnits } = await session.retryWithBackoff(() =>
+            api.metadata
+                .get({ organisationUnits: { fields: COUNTRY_FIELDS, filter: attempt.filter } })
+                .getData()
+        );
 
         if (organisationUnits.length === 1) {
             const ou = organisationUnits[0]!;
@@ -2006,7 +2878,9 @@ export function computeColumnCount(
     metaKeyCount: number,
     valueColumnCount: number
 ): number {
-    return keyColumnsFor(form, byKey).length + FIXED_NON_META_COLUMNS + metaKeyCount + valueColumnCount;
+    return (
+        keyColumnsFor(form, byKey).length + FIXED_NON_META_COLUMNS + metaKeyCount + valueColumnCount
+    );
 }
 
 /**
@@ -2077,14 +2951,19 @@ async function discoverForm(
         const [first, last, meta] = await Promise.all([
             probe("asc"),
             probe("desc"),
-            fetchProgramMeta(api, form.uid),
+            fetchProgramMeta(api, session, form.uid),
         ]);
         return {
             form,
             total: first.total ?? 0,
             minDate: first.instances[0]?.occurredAt,
             maxDate: last.instances[0]?.occurredAt,
-            columns: computeColumnCount(form, byKey, EVENT_META_KEYS.length, meta.dataElements.size),
+            columns: computeColumnCount(
+                form,
+                byKey,
+                EVENT_META_KEYS.length,
+                [...meta.stageById.values()].reduce((sum, s) => sum + s.dataElementLabels.size, 0)
+            ),
             stages: [],
         };
     }
@@ -2106,7 +2985,11 @@ async function discoverForm(
                 .getData()
         );
 
-    const [first, last, meta] = await Promise.all([probe("asc"), probe("desc"), fetchProgramMeta(api, form.uid)]);
+    const [first, last, meta] = await Promise.all([
+        probe("asc"),
+        probe("desc"),
+        fetchProgramMeta(api, session, form.uid),
+    ]);
 
     const nonRepeatableDataElementCount = [...meta.stageById.values()]
         .filter(s => !s.repeatable)
@@ -2162,7 +3045,14 @@ export async function discover(
         forms.map(f => [f.key, { form: f, records: [], columns: new Map() }])
     );
 
-    return mapWithConcurrency(forms, FETCH_CONCURRENCY, f => discoverForm(api, f, orgUnit, session, byKey));
+    return mapWithConcurrency(forms, FETCH_CONCURRENCY, f =>
+        discoverForm(api, f, orgUnit, session, byKey)
+    );
+}
+
+/** "CaseReport [custom]" / "CaseReport [default]": which program of a form is meant. */
+function programLabel(form: ResolvedForm): string {
+    return `${form.key} [${form.isCustom ? "custom" : "default"}]`;
 }
 
 function shortDate(iso: string | undefined): string {
@@ -2227,10 +3117,16 @@ export function forecastWorkbook(discoveries: FormDiscovery[]): WorkbookForecast
     const addSheet = (f: SheetForecast) => {
         sheets.push(f);
         if (f.columns !== undefined && f.columns > LARGE_SHEET_COLUMN_WARNING) {
-            warnings.push(`${f.sheetKey}: ${f.columns} columns — wide sheet, slow to browse by hand in Excel`);
+            warnings.push(
+                `${f.sheetKey}: ${f.columns} columns — wide sheet, slow to browse by hand in Excel`
+            );
         }
         if (f.rows !== undefined && f.rows > LARGE_SHEET_ROW_WARNING) {
-            warnings.push(`${f.sheetKey}: ${f.rows.toLocaleString()} rows — approaching Excel's 1,048,576-row limit`);
+            warnings.push(
+                `${
+                    f.sheetKey
+                }: ${f.rows.toLocaleString()} rows — approaching Excel's 1,048,576-row limit`
+            );
         }
     };
 
@@ -2239,7 +3135,8 @@ export function forecastWorkbook(discoveries: FormDiscovery[]): WorkbookForecast
             sheetKey: d.form.key,
             rows: d.total,
             columns: d.columns,
-            cells: d.total !== undefined && d.columns !== undefined ? d.total * d.columns : undefined,
+            cells:
+                d.total !== undefined && d.columns !== undefined ? d.total * d.columns : undefined,
         });
         // A stage with a proven-zero row count produces no sheet at extraction time
         // either (fetchTracker only creates one once at least one event exists).
@@ -2264,7 +3161,10 @@ export function forecastWorkbook(discoveries: FormDiscovery[]): WorkbookForecast
     return {
         sheets,
         totalCells,
-        estimatedSizeBytesRange: [totalCells * BYTES_PER_CELL_LOW, totalCells * BYTES_PER_CELL_HIGH],
+        estimatedSizeBytesRange: [
+            totalCells * BYTES_PER_CELL_LOW,
+            totalCells * BYTES_PER_CELL_HIGH,
+        ],
         warnings,
     };
 }
@@ -2285,11 +3185,12 @@ export function reportDiscovery(
         console.log(`\nScope: org unit ${rootOrgUnit} (with descendants)`);
     }
 
-    console.log("\nForms detected:");
+    console.log("\nForms detected (one row per program; programs of one form share a sheet):");
     console.log(
         "  " +
             [
                 "SHEET".padEnd(18),
+                "PROGRAM".padEnd(13),
                 "KIND".padEnd(8),
                 "CUSTOM".padEnd(7),
                 "RECORDS".padStart(9),
@@ -2305,6 +3206,7 @@ export function reportDiscovery(
             "  " +
                 [
                     d.form.key.padEnd(18),
+                    d.form.uid.padEnd(13),
                     d.form.kind.padEnd(8),
                     (d.form.isCustom ? "yes" : "no").padEnd(7),
                     total.padStart(9),
@@ -2335,18 +3237,22 @@ export function reportDiscovery(
     );
 
     console.log(`\nPlanned extraction scope:`);
-    console.log(`  forms with data      : ${withData.length}/${discoveries.length}`);
+    console.log(`  programs with data   : ${withData.length}/${discoveries.length}`);
     console.log(`  main-sheet records   : ${totalRecords}`);
     if (totalStageRecords > 0) {
         console.log(`  repeatable-stage rows: ${totalStageRecords}`);
     }
     if (empty.length > 0) {
-        console.log(`  skipped (0 records): ${empty.map(d => d.form.key).join(", ")}`);
+        console.log(`  skipped (0 records): ${empty.map(d => programLabel(d.form)).join(", ")}`);
     }
     const dataSets = discoveries.filter(d => d.form.kind === "dataSet");
     if (dataSets.length > 0) {
         console.log(
-            `  ${dataSets.map(d => d.form.key).join(", ")}: aggregate dataSet — scope set by --start-date/--end-date`
+            `  ${dataSets
+                .map(d => d.form.key)
+                .join(
+                    ", "
+                )}: aggregate dataSet — all periods unless --start-date/--end-date are given`
         );
     }
     if (unresolved.length > 0) {
@@ -2355,7 +3261,12 @@ export function reportDiscovery(
 
     const forecast = forecastWorkbook(discoveries);
     console.log(`\nWorkbook forecast:`);
-    console.log(`  worksheets    : ${2 + forecast.sheets.length}  (_index, _relationships + ${forecast.sheets.length} form sheet(s))`);
+    const formSheets = new Set(forecast.sheets.map(s => s.sheetKey)).size;
+    console.log(
+        `  worksheets    : ${
+            2 + formSheets
+        }  (_index, _relationships + ${formSheets} form sheet(s))`
+    );
     console.log(`  rows          : exact (probed)`);
     console.log(`  columns/cells : UPPER BOUND — every configured field is counted, but a sheet`);
     console.log(`                  only gets a column for a field some record actually fills in.`);
@@ -2381,7 +3292,7 @@ export function facilitiesWithData(all: FormData[], facilityKey: string): Set<st
 
 // --- Main ---------------------------------------------------------------------
 
-async function extract(args: {
+type ExtractArgs = {
     output?: string;
     country?: string;
     orgUnit?: string;
@@ -2390,8 +3301,22 @@ async function extract(args: {
     pageSize: number;
     dryRun: boolean;
     discover: boolean;
+    perCountry: boolean;
     forms?: string;
-}) {
+};
+
+/** Everything one scope's extraction needs that does not depend on the scope. */
+type RunContext = {
+    api: D2Api;
+    session: SessionManager;
+    baseUrl: string;
+    envLabel: string;
+    resolved: ResolvedForm[];
+    unresolved: { spec: FormSpec; reason: string }[];
+    args: ExtractArgs;
+};
+
+async function extract(args: ExtractArgs) {
     const envVars = getEnvVars();
     const baseUrl = envVars.url.replace(/\/+$/, "");
     const envLabel = deriveEnvLabel(baseUrl);
@@ -2403,18 +3328,23 @@ async function extract(args: {
     await warmUpSession(api);
     const session = createSessionManager(api);
 
-    const info = await api.system.info.getData();
+    const info = await session.retryWithBackoff(() => api.system.info.getData());
     console.log(`  DHIS2 ${info.version}`);
 
-    const modules = await fetchModules(api);
+    const modules = await fetchModules(api, session);
     console.log(`  datastore modules: ${modules.map(m => m.name).join(", ") || "(none)"}`);
 
     const wanted = args.forms
-        ? FORMS.filter(f => args.forms!.split(",").map(s => s.trim()).includes(f.key))
+        ? FORMS.filter(f =>
+              args
+                  .forms!.split(",")
+                  .map(s => s.trim())
+                  .includes(f.key)
+          )
         : FORMS;
     if (wanted.length === 0) throw new Error(`No forms matched --forms=${args.forms}`);
 
-    const { resolved, unresolved } = await resolveForms(api, modules, wanted);
+    const { resolved, unresolved } = await resolveForms(api, session, modules, wanted);
     linkParents(resolved);
     reportResolution(resolved, unresolved);
 
@@ -2424,11 +3354,68 @@ async function extract(args: {
     }
     if (resolved.length === 0) throw new Error("No forms could be resolved; nothing to extract.");
 
-    // --- Discovery ------------------------------------------------------------
-    // Scope: an explicit --org-unit wins; otherwise --country; otherwise everything readable.
-    const country = args.country ? await resolveCountry(api, args.country) : undefined;
-    const rootOrgUnit = args.orgUnit ?? country?.id;
+    const ctx: RunContext = { api, session, baseUrl, envLabel, resolved, unresolved, args };
 
+    if (args.perCountry) {
+        if (args.country || args.orgUnit) {
+            throw new Error("--per-country cannot be combined with --country or --org-unit.");
+        }
+        const countries = await countriesWithData(api, session, resolved);
+        console.log(
+            `\nCountries with data (${countries.length}): ${countries
+                .map(c => c.code || c.name)
+                .join(", ")}`
+        );
+
+        // One country failing (after its retries) must not cost the others their workbooks.
+        const results: { country: ResolvedCountry; programs?: string[]; error?: string }[] = [];
+        for (const country of countries) {
+            console.log(`\n=== ${country.name}${country.code ? ` (${country.code})` : ""} ===`);
+            try {
+                results.push({ country, programs: await extractScope(ctx, country, country.id) });
+            } catch (err) {
+                const error = err instanceof Error ? err.message : String(err);
+                console.error(`  ! ${country.name}: FAILED — ${error}`);
+                results.push({ country, error });
+            }
+        }
+
+        console.log("\nPrograms used per country:");
+        for (const { country, programs, error } of results) {
+            const label = country.code || country.name;
+            console.log(
+                `  ${label}: ${error ? `FAILED — ${error}` : programs?.join("; ") || "(none)"}`
+            );
+        }
+        const failed = results.filter(r => r.error);
+        if (failed.length > 0) {
+            throw new Error(
+                `${failed.length} of ${results.length} countries failed: ${failed
+                    .map(r => r.country.code || r.country.name)
+                    .join(", ")}`
+            );
+        }
+        return;
+    }
+
+    const country = args.country ? await resolveCountry(api, session, args.country) : undefined;
+    await extractScope(ctx, country, args.orgUnit ?? country?.id);
+}
+
+/**
+ * Discovers, extracts and writes one workbook for one scope (a country, an org unit, or
+ * everything readable). Returns the programs it extracted, as "Form: program (records)".
+ */
+async function extractScope(
+    ctx: RunContext,
+    country: ResolvedCountry | undefined,
+    rootOrgUnit: string | undefined
+): Promise<string[]> {
+    const { api, session, baseUrl, envLabel, resolved, unresolved, args } = ctx;
+    const started = Date.now();
+    const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
+
+    // --- Discovery ------------------------------------------------------------
     let discoveries: FormDiscovery[] = [];
     if (rootOrgUnit) {
         console.log("\nDiscovering ...");
@@ -2440,67 +3427,92 @@ async function extract(args: {
 
     if (args.discover) {
         console.log("\nDiscovery only: no data extracted, no file written.");
-        return;
+        return [];
     }
 
-    // Only skip forms proven to have exactly zero records — never narrow on anything else.
-    const totalByKey = new Map(discoveries.map(d => [d.form.key, d.total]));
-    const toExtract = resolved.filter(f => totalByKey.get(f.key) !== 0);
-    const skipped = resolved.filter(f => totalByKey.get(f.key) === 0);
+    // Only skip programs proven to have exactly zero records — never narrow on anything else.
+    const totalByUid = new Map(discoveries.map(d => [d.form.uid, d.total]));
+    const toExtract = resolved.filter(f => totalByUid.get(f.uid) !== 0);
+    const skipped = resolved.filter(f => totalByUid.get(f.uid) === 0);
     if (skipped.length > 0) {
-        console.log(`\nSkipping ${skipped.length} form(s) with 0 records: ${skipped.map(f => f.key).join(", ")}`);
+        console.log(
+            `\nSkipping ${skipped.length} program(s) with 0 records: ${skipped
+                .map(programLabel)
+                .join(", ")}`
+        );
     }
 
-    console.log("\nExtracting ...");
+    console.log(`\nExtracting ... (discovery took ${elapsed()})`);
     const opts: FetchOpts = {
         orgUnit: rootOrgUnit,
         pageSize: args.pageSize,
         startDate: args.startDate,
         endDate: args.endDate,
+        requests: createLimiter(REQUEST_CONCURRENCY),
+        // Without a scope, dataSets are read under the user's own root org units.
+        dataSetRoots:
+            !rootOrgUnit && toExtract.some(f => f.kind === "dataSet")
+                ? await userRootOrgUnits(api, session)
+                : undefined,
     };
 
     // Declared before extraction (not after) so fetchTracker can record diagnostics
     // (e.g. unresolved stage events) as they happen, not as an afterthought.
     const integrity = emptyIntegrityReport();
 
-    // Forms are independent of each other, so they are fetched with bounded concurrency
-    // rather than one at a time — this is the dominant cost of a run. `mapWithConcurrency`
-    // preserves input order, so sheet order stays deterministic regardless of which form
-    // happens to finish first.
-    const perForm = await mapWithConcurrency(toExtract, EXTRACT_CONCURRENCY, async form => {
-        if (form.kind === "dataSet") {
-            return [await session.retryWithBackoff(() => fetchDataSet(api, form, opts))];
-        }
-        const meta = await session.retryWithBackoff(() => fetchProgramMeta(api, form.uid));
-        if (form.kind !== "tracker") {
-            return [await fetchEvents(api, form, meta, opts, session, integrity)];
-        }
-        const { main, stageForms } = await fetchTracker(api, form, meta, opts, session, integrity);
-        for (const stage of stageForms) {
-            console.log(`  ${stage.form.key}: ${stage.records.length} rows (repeatable stage)`);
-        }
-        return [main, ...stageForms];
-    });
-    const all: FormData[] = perForm.flat();
+    // Programs are independent, so several are fetched at once; their page requests share
+    // one cap (opts.requests). `mapWithConcurrency` preserves input order, so sheet order
+    // stays deterministic regardless of which program finishes first.
+    const perProgram = (
+        await mapWithConcurrency(toExtract, EXTRACT_CONCURRENCY, async form => {
+            const formOpts = { ...opts, total: totalByUid.get(form.uid) };
+            if (form.kind === "dataSet")
+                return [await fetchDataSet(api, form, formOpts, session, integrity)];
+            const meta = await fetchProgramMeta(api, session, form.uid);
+            if (form.kind !== "tracker")
+                return [await fetchEvents(api, form, meta, formOpts, session, integrity)];
+            const { main, stageForms } = await fetchTracker(
+                api,
+                form,
+                meta,
+                formOpts,
+                session,
+                integrity
+            );
+            for (const stage of stageForms) {
+                console.log(`  ${stage.form.key}: ${stage.records.length} rows (repeatable stage)`);
+            }
+            return [main, ...stageForms];
+        })
+    ).flat();
+    console.log(`  fetched in ${elapsed()}`);
+
+    const programs = perProgram
+        .filter(d => d.form.kind !== "trackerStage")
+        .map(d => `${d.form.key}: ${d.form.serverName} (${d.records.length})`);
+
+    // One sheet per form, however many programs back it.
+    const all = mergeByFormKey(perProgram);
 
     const byKey = new Map(all.map(d => [d.form.key, d]));
-    const recordIndex = new Map(
-        all.map(d => [d.form.key, new Map(d.records.map(r => [r.id, r]))])
-    );
+    const recordIndex = new Map(all.map(d => [d.form.key, new Map(d.records.map(r => [r.id, r]))]));
 
     // --- Integrity ------------------------------------------------------------
     const facilityForm = resolved.find(f => f.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID);
     if (facilityForm) resolveFacilityIds(all, facilityForm.key, integrity);
-    crossCheckSurveyIds(all, recordIndex, integrity);
+    await flagRecords(all, recordIndex, ids => lookUpReferences(api, session, ids));
 
     // Reconciliation: what discovery said exists vs what we actually pulled. This is what
     // proves the skip/scope optimisation above never silently dropped data.
+    const expected = expectedRecordCounts(toExtract, totalByUid, discoveries);
     const reconciliation = all.map(d => ({
         formKey: d.form.key,
-        expected: totalByKey.get(d.form.key),
+        expected: expected.get(d.form.key),
         actual: d.records.length,
     }));
-    const mismatches = reconciliation.filter(r => r.expected !== undefined && r.expected !== r.actual);
+    const mismatches = reconciliation.filter(
+        r => r.expected !== undefined && r.expected !== r.actual
+    );
     if (mismatches.length > 0) {
         console.warn("\n  ! RECONCILIATION MISMATCH — extracted count != discovered count:");
         for (const m of mismatches) {
@@ -2510,12 +3522,38 @@ async function extract(args: {
         console.log("\nReconciliation: all forms match their discovered counts.");
     }
 
-    const orgUnitIds = [...new Set(all.flatMap(d => d.records.map(r => r.orgUnit)).filter(Boolean))];
+    const orgUnitIds = [
+        ...new Set(all.flatMap(d => d.records.map(r => r.orgUnit)).filter(Boolean)),
+    ];
     console.log(`\nResolving ${orgUnitIds.length} org unit names ...`);
-    const orgUnitNames = await fetchOrgUnitNames(api, orgUnitIds);
+    const orgUnitNames = await fetchOrgUnitNames(api, session, orgUnitIds);
+
+    // Name the file after the instance and country so an extract is never ambiguous
+    // about where it came from (mirrors glass-dev's deriveEnvLabel convention).
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const countryPart = country ? `${(country.code || country.name).toLowerCase()}_` : "";
+    const fileName = `amr-surveys_${envLabel}_${countryPart}${timestamp}.xlsx`;
+
+    // With --per-country, --output names a directory (one file per country goes in it).
+    const outPath = args.perCountry
+        ? path.resolve(args.output ?? "extracts", fileName)
+        : path.resolve(args.output ?? `extracts/${fileName}`);
+    // Written under a temporary name and renamed when complete, so a run that dies midway
+    // never leaves a truncated workbook that looks like a finished extract.
+    const partialPath = `${outPath}.partial`;
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
 
     console.log("Writing workbook ...");
-    const workbook = new Excel.Workbook();
+    // Streaming: rows go to disk as they are written instead of building the whole workbook
+    // in memory first, which was two thirds of a country's run time.
+    // Its zip library defaults to the fastest compression (level 1); level 6 makes the file
+    // about a quarter smaller for a second or two of CPU.
+    const workbook = new Excel.stream.xlsx.WorkbookWriter({
+        filename: partialPath,
+        useStyles: true,
+        useSharedStrings: true,
+        zip: { zlib: { level: 6 } },
+    });
     workbook.creator = "amr-surveys extract-forms";
     workbook.created = new Date();
 
@@ -2538,25 +3576,38 @@ async function extract(args: {
     writeRelationshipsSheet(workbook, all, facilityForm?.key);
     for (const data of all) {
         const name = sheetNames.get(data.form.key) ?? data.form.key.slice(0, EXCEL_SHEET_NAME_MAX);
-        writeFormSheet(workbook, data, byKey, recordIndex, orgUnitNames, name, integrity);
+        writeFormSheet(workbook, data, byKey, recordIndex, orgUnitNames, name);
     }
-
-    // Name the file after the instance and country so an extract is never ambiguous
-    // about where it came from (mirrors glass-dev's deriveEnvLabel convention).
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const countryPart = country ? `${(country.code || country.name).toLowerCase()}_` : "";
-    const defaultOut = `extracts/amr-surveys_${envLabel}_${countryPart}${timestamp}.xlsx`;
-
-    const outPath = path.resolve(args.output ?? defaultOut);
-    fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    await workbook.xlsx.writeFile(outPath);
+    await workbook.commit();
+    fs.renameSync(partialPath, outPath);
 
     const total = all.reduce((sum, d) => sum + d.records.length, 0);
-    console.log(`\nDone. ${total} records across ${all.length} sheets -> ${outPath}`);
+    console.log(
+        `\nDone in ${elapsed()}. ${total} records across ${all.length} sheets -> ${outPath}`
+    );
 
     const facilities = facilityForm ? facilitiesWithData(all, facilityForm.key) : new Set();
     if (facilities.size > 0) console.log(`  facilities with data: ${facilities.size}`);
-    reportIntegrity(integrity);
+    reportIntegrity(integrity, all);
+    return programs;
+}
+
+/** The user's root org units for data reads: data-view roots, else capture roots. */
+async function userRootOrgUnits(api: D2Api, session: SessionManager): Promise<string[]> {
+    const me = await session.retryWithBackoff(() =>
+        api
+            .get<{
+                organisationUnits?: { id: string }[];
+                dataViewOrganisationUnits?: { id: string }[];
+            }>("/me", {
+                fields: "organisationUnits[id],dataViewOrganisationUnits[id]",
+            })
+            .getData()
+    );
+    const roots = me.dataViewOrganisationUnits?.length
+        ? me.dataViewOrganisationUnits
+        : me.organisationUnits ?? [];
+    return roots.map(ou => ou.id);
 }
 
 function main() {
@@ -2571,7 +3622,7 @@ function main() {
                 long: "output",
                 short: "o",
                 description:
-                    "Output .xlsx path. Defaults to extracts/amr-surveys_<env>_<country>_<timestamp>.xlsx",
+                    "Output .xlsx path (a directory with --per-country). Defaults to extracts/amr-surveys_<env>_<country>_<timestamp>.xlsx",
             }),
             country: option({
                 type: optional(string),
@@ -2588,12 +3639,13 @@ function main() {
             startDate: option({
                 type: optional(string),
                 long: "start-date",
-                description: "Start date YYYY-MM-DD (Ward Summary Statistics only)",
+                description:
+                    "Start date YYYY-MM-DD (Ward Summary Statistics only; default 2000-01-01)",
             }),
             endDate: option({
                 type: optional(string),
                 long: "end-date",
-                description: "End date YYYY-MM-DD (Ward Summary Statistics only)",
+                description: "End date YYYY-MM-DD (Ward Summary Statistics only; default today)",
             }),
             pageSize: option({
                 type: number,
@@ -2610,6 +3662,12 @@ function main() {
                 type: boolean,
                 long: "dry-run",
                 description: "Resolve names to UIDs and print the mapping without extracting",
+            }),
+            perCountry: flag({
+                type: boolean,
+                long: "per-country",
+                description:
+                    "Write one workbook per country that has data (countries are taken from the Survey records), and print the programs each country used.",
             }),
             discover: flag({
                 type: boolean,

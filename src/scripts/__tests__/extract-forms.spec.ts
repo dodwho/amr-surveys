@@ -4,19 +4,34 @@ import {
     buildBreadcrumb,
     buildStageChildForm,
     buildTrackerRecords,
+    candidateProgramIds,
     computeColumnCount,
-    crossCheckSurveyIds,
+    createLimiter,
     emptyIntegrityReport,
-    finalizeColumns,
+    expectedRecordCounts,
+    fetchAllPages,
+    flagRecords,
     forecastWorkbook,
     formatBytes,
     keyColumnsFor,
     linkParents,
+    makePageGuard,
+    mapWithConcurrency,
+    mergeByFormKey,
+    orderColumns,
     pascalizeStageName,
+    placeSpeciesOtherAfterSpecies,
     resolveFacilityIds,
+    summariseFlags,
+    toCellValue,
+    uniqueLabels,
 } from "../extract-forms";
+import type { AMRSurveyModule } from "../../domain/entities/AMRSurveyModule";
+import { describe, expect, it, vi } from "vitest";
 import type {
     FormData,
+    OffFormTracker,
+    ReferenceStatus,
     FormDiscovery,
     ProgramMeta,
     ProgramStageMeta,
@@ -53,11 +68,14 @@ function record(overrides: Partial<Record_> & Pick<Record_, "id">): Record_ {
         label: overrides.id,
         values: new Map(),
         meta: new Map(),
+        flags: [],
         ...overrides,
     };
 }
 
-function stage(overrides: Partial<ProgramStageMeta> & Pick<ProgramStageMeta, "id" | "name">): ProgramStageMeta {
+function stage(
+    overrides: Partial<ProgramStageMeta> & Pick<ProgramStageMeta, "id" | "name">
+): ProgramStageMeta {
     return {
         repeatable: false,
         sortOrder: 0,
@@ -68,13 +86,16 @@ function stage(overrides: Partial<ProgramStageMeta> & Pick<ProgramStageMeta, "id
     };
 }
 
-function programMeta(overrides: Partial<ProgramMeta> & { stages?: ProgramStageMeta[] } = {}): ProgramMeta {
+function programMeta(
+    overrides: Partial<ProgramMeta> & { stages?: ProgramStageMeta[] } = {}
+): ProgramMeta {
     const { stages, ...rest } = overrides;
     return {
         attributes: new Map(),
         attributeOrder: new Map(),
-        dataElements: new Map(),
         stageById: new Map((stages ?? []).map(s => [s.id, s])),
+        valueTypes: new Map(),
+        optionNames: new Map(),
         ...rest,
     };
 }
@@ -89,7 +110,12 @@ function indexOf(all: FormData[]) {
 /** The real graph: Facility and CaseReport both hang off Survey; leaves hang off CaseReport. */
 function realGraphForms() {
     return {
-        survey: form({ key: "Survey", uid: PREVALENCE_SURVEY_FORM_ID, defaultUid: PREVALENCE_SURVEY_FORM_ID, kind: "event" }),
+        survey: form({
+            key: "Survey",
+            uid: PREVALENCE_SURVEY_FORM_ID,
+            defaultUid: PREVALENCE_SURVEY_FORM_ID,
+            kind: "event",
+        }),
         facility: form({
             key: "Facility",
             uid: PREVALENCE_FACILITY_LEVEL_FORM_ID,
@@ -114,8 +140,16 @@ function realGraphForms() {
 describe("linkParents", () => {
     it("links Case report to Survey, not Facility (the app filters it by parentSurveyId)", () => {
         const resolved = [
-            form({ key: "Survey", uid: PREVALENCE_SURVEY_FORM_ID, defaultUid: PREVALENCE_SURVEY_FORM_ID }),
-            form({ key: "Facility", uid: PREVALENCE_FACILITY_LEVEL_FORM_ID, defaultUid: PREVALENCE_FACILITY_LEVEL_FORM_ID }),
+            form({
+                key: "Survey",
+                uid: PREVALENCE_SURVEY_FORM_ID,
+                defaultUid: PREVALENCE_SURVEY_FORM_ID,
+            }),
+            form({
+                key: "Facility",
+                uid: PREVALENCE_FACILITY_LEVEL_FORM_ID,
+                defaultUid: PREVALENCE_FACILITY_LEVEL_FORM_ID,
+            }),
             // Deliberately wrong on the way in — linkParents must correct it.
             form({
                 key: "CaseReport",
@@ -133,7 +167,12 @@ describe("linkParents", () => {
 
     it("links a custom leaf form to Case report via the default UID it overrides", () => {
         const resolved = [
-            form({ key: "CaseReport", uid: "custom-crf", defaultUid: PREVALENCE_CASE_REPORT_FORM_ID, isCustom: true }),
+            form({
+                key: "CaseReport",
+                uid: "custom-crf",
+                defaultUid: PREVALENCE_CASE_REPORT_FORM_ID,
+                isCustom: true,
+            }),
             form({
                 key: "FollowUpD28",
                 uid: "custom-followup",
@@ -174,12 +213,19 @@ describe("keyColumnsFor", () => {
         }));
         const { byKey } = indexOf(all);
 
-        expect(keyColumnsFor(caseReport, byKey).map(c => c.header)).toEqual(["Survey_id", "Facility_id"]);
+        expect(keyColumnsFor(caseReport, byKey).map(c => c.header)).toEqual([
+            "Survey_id",
+            "Facility_id",
+        ]);
     });
 
     it("gives Facility only Survey_id, and Survey none", () => {
         const { survey, facility } = realGraphForms();
-        const all: FormData[] = [survey, facility].map(f => ({ form: f, records: [], columns: new Map() }));
+        const all: FormData[] = [survey, facility].map(f => ({
+            form: f,
+            records: [],
+            columns: new Map(),
+        }));
         const { byKey } = indexOf(all);
 
         expect(keyColumnsFor(facility, byKey).map(c => c.header)).toEqual(["Survey_id"]);
@@ -220,8 +266,16 @@ describe("resolveFacilityIds", () => {
         const { survey, facility, caseReport } = realGraphForms();
         const all: FormData[] = [
             { form: survey, records: [], columns: new Map() },
-            { form: facility, records: [record({ id: "F1", surveyId: "S1", orgUnit: "OU_A" })], columns: new Map() },
-            { form: caseReport, records: [record({ id: "C1", surveyId: "S2", orgUnit: "OU_A" })], columns: new Map() },
+            {
+                form: facility,
+                records: [record({ id: "F1", surveyId: "S1", orgUnit: "OU_A" })],
+                columns: new Map(),
+            },
+            {
+                form: caseReport,
+                records: [record({ id: "C1", surveyId: "S2", orgUnit: "OU_A" })],
+                columns: new Map(),
+            },
         ];
         const report = emptyIntegrityReport();
 
@@ -241,7 +295,11 @@ describe("resolveFacilityIds", () => {
                 ],
                 columns: new Map(),
             },
-            { form: caseReport, records: [record({ id: "C1", surveyId: "S1", orgUnit: "OU_A" })], columns: new Map() },
+            {
+                form: caseReport,
+                records: [record({ id: "C1", surveyId: "S1", orgUnit: "OU_A" })],
+                columns: new Map(),
+            },
         ];
         const report = emptyIntegrityReport();
 
@@ -257,7 +315,11 @@ describe("resolveFacilityIds", () => {
     it("marks a Facility record as its own facility", () => {
         const { facility } = realGraphForms();
         const all: FormData[] = [
-            { form: facility, records: [record({ id: "F1", surveyId: "S1", orgUnit: "OU_A" })], columns: new Map() },
+            {
+                form: facility,
+                records: [record({ id: "F1", surveyId: "S1", orgUnit: "OU_A" })],
+                columns: new Map(),
+            },
         ];
 
         resolveFacilityIds(all, "Facility", emptyIntegrityReport());
@@ -266,39 +328,149 @@ describe("resolveFacilityIds", () => {
     });
 });
 
-describe("crossCheckSurveyIds", () => {
-    it("flags a leaf whose own Survey_id disagrees with the Survey via its parent", () => {
-        const { caseReport, followUp } = realGraphForms();
+describe("flagRecords", () => {
+    const { survey, facility, caseReport, followUp } = realGraphForms();
+    const noLookup = async () => new Map<string, ReferenceStatus>();
+    const flagsOf = (r: Record_) => r.flags.map(f => f.flag);
+
+    /** Survey S1 > CaseReport C1 > FollowUp U1, plus whatever extra records a test adds. */
+    function graph(extra: { caseReports?: Record_[]; followUps?: Record_[] } = {}) {
+        const surveyRec = record({ id: "S1", surveyId: "S1" });
+        const caseRec = record({ id: "C1", surveyId: "S1", parentId: "S1" });
+        const followRec = record({ id: "U1", surveyId: "S1", parentId: "C1" });
         const all: FormData[] = [
-            { form: caseReport, records: [record({ id: "C1", surveyId: "S1" })], columns: new Map() },
+            { form: survey, records: [surveyRec], columns: new Map() },
+            {
+                form: caseReport,
+                records: [caseRec, ...(extra.caseReports ?? [])],
+                columns: new Map(),
+            },
             {
                 form: followUp,
-                records: [record({ id: "U1", surveyId: "S_WRONG", parentId: "C1" })],
+                records: [followRec, ...(extra.followUps ?? [])],
                 columns: new Map(),
             },
         ];
-        const { recordIndex } = indexOf(all);
-        const report = emptyIntegrityReport();
+        return { all, recordIndex: indexOf(all).recordIndex, caseRec, followRec };
+    }
 
-        crossCheckSurveyIds(all, recordIndex, report);
+    it("leaves consistent records unflagged and asks DHIS2 nothing", async () => {
+        const { all, recordIndex, caseRec, followRec } = graph();
+        const lookUp = vi.fn(noLookup);
 
-        expect(report.surveyMismatches).toEqual([
-            { formKey: "FollowUpD28", recordId: "U1", own: "S_WRONG", viaParent: "S1" },
+        await flagRecords(all, recordIndex, lookUp);
+
+        expect([...caseRec.flags, ...followRec.flags]).toEqual([]);
+        expect(lookUp).not.toHaveBeenCalled();
+    });
+
+    it("flags an unknown or missing Survey_id as TEST/INVALID", async () => {
+        const junk = record({ id: "C2", surveyId: "TEST SURVEY ID", parentId: "TEST SURVEY ID" });
+        const blank = record({ id: "C3", surveyId: "", parentId: "" });
+        const { all, recordIndex } = graph({ caseReports: [junk, blank] });
+
+        await flagRecords(all, recordIndex, noLookup);
+
+        expect(junk.flags).toEqual([
+            { flag: "TEST/INVALID", detail: 'Survey_id "TEST SURVEY ID" is not a survey in DHIS2' },
+        ]);
+        expect(flagsOf(blank)).toEqual(["TEST/INVALID"]);
+    });
+
+    it("tells a deleted parent from one that never existed, looking up only real ids", async () => {
+        const childOfDeleted = record({ id: "U2", surveyId: "S1", parentId: "DeletedCR01" });
+        const childOfJunk = record({ id: "U3", surveyId: "S1", parentId: "test" });
+        const { all, recordIndex } = graph({ followUps: [childOfDeleted, childOfJunk] });
+        const lookUp = vi.fn(
+            async () =>
+                new Map<string, ReferenceStatus>([
+                    ["DeletedCR01", { status: "deleted", lastUpdated: "2025-09-29T10:38:33.383" }],
+                ])
+        );
+
+        await flagRecords(all, recordIndex, lookUp);
+
+        expect(lookUp).toHaveBeenCalledWith({ surveys: [], trackedEntities: ["DeletedCR01"] });
+        expect(childOfDeleted.flags).toEqual([
+            {
+                flag: "PARENT DELETED",
+                detail: "CaseReport DeletedCR01 was deleted in DHIS2 (last changed 2025-09-29)",
+            },
+        ]);
+        expect(childOfJunk.flags).toEqual([
+            { flag: "PARENT MISSING", detail: 'CaseReport "test" does not exist in DHIS2' },
         ]);
     });
 
-    it("is silent when the ids agree", () => {
-        const { caseReport, followUp } = realGraphForms();
-        const all: FormData[] = [
-            { form: caseReport, records: [record({ id: "C1", surveyId: "S1" })], columns: new Map() },
-            { form: followUp, records: [record({ id: "U1", surveyId: "S1", parentId: "C1" })], columns: new Map() },
-        ];
-        const { recordIndex } = indexOf(all);
-        const report = emptyIntegrityReport();
+    it("says when a parent exists but outside the extract", async () => {
+        const child = record({ id: "U2", surveyId: "S1", parentId: "OtherCR0001" });
+        const { all, recordIndex } = graph({ followUps: [child] });
 
-        crossCheckSurveyIds(all, recordIndex, report);
+        await flagRecords(
+            all,
+            recordIndex,
+            async () =>
+                new Map<string, ReferenceStatus>([
+                    ["OtherCR0001", { status: "elsewhere", orgUnit: "Kenya" }],
+                ])
+        );
 
-        expect(report.surveyMismatches).toEqual([]);
+        expect(flagsOf(child)).toEqual(["OUTSIDE EXTRACT"]);
+        expect(child.flags[0]!.detail).toContain("under Kenya");
+    });
+
+    it("flags a survey mismatch with the parent", async () => {
+        const stray = record({ id: "U2", surveyId: "S_WRONG", parentId: "C1" });
+        const { all, recordIndex } = graph({ followUps: [stray] });
+
+        await flagRecords(all, recordIndex, noLookup);
+
+        expect(flagsOf(stray)).toEqual(["TEST/INVALID", "SURVEY MISMATCH"]);
+    });
+
+    it("passes a parent's flags down to its children, including repeatable-stage rows", async () => {
+        const junkCase = record({ id: "C9", surveyId: "test", parentId: "test" });
+        const childOfJunk = record({ id: "U9", surveyId: "S1", parentId: "C9" });
+        const { all } = graph({ caseReports: [junkCase], followUps: [childOfJunk] });
+
+        const wardForm = buildStageChildForm(
+            facility,
+            stage({ id: "WARD", name: "Ward data", repeatable: true }),
+            "Facility__WardData"
+        );
+        const junkFacility = record({ id: "F9", surveyId: "nope" });
+        const wardRow = record({ id: "W9", surveyId: "nope", parentId: "F9" });
+        all.push(
+            { form: facility, records: [junkFacility], columns: new Map() },
+            { form: wardForm, records: [wardRow], columns: new Map() }
+        );
+
+        await flagRecords(all, indexOf(all).recordIndex, noLookup);
+
+        // Its own Survey_id (S1) also disagrees with the junk parent's, which is a finding too.
+        expect(flagsOf(childOfJunk)).toEqual(["SURVEY MISMATCH", "PARENT FLAGGED"]);
+        expect(childOfJunk.flags[1]!.detail).toBe("CaseReport C9 is flagged: TEST/INVALID");
+        expect(flagsOf(wardRow)).toEqual(["PARENT FLAGGED"]);
+    });
+
+    it("skips the Survey_id check when the Survey form is not in the run", async () => {
+        const caseOnly = record({ id: "C1", surveyId: "S1", parentId: "S1" });
+        const all: FormData[] = [{ form: caseReport, records: [caseOnly], columns: new Map() }];
+
+        await flagRecords(all, indexOf(all).recordIndex, noLookup);
+
+        expect(caseOnly.flags).toEqual([]);
+    });
+
+    it("summarises flagged records per sheet and flag", async () => {
+        const junk = record({ id: "C2", surveyId: "x", parentId: "x" });
+        const { all, recordIndex } = graph({ caseReports: [junk] });
+
+        await flagRecords(all, recordIndex, noLookup);
+
+        expect(summariseFlags(all)).toEqual([
+            { sheet: "CaseReport", flag: "TEST/INVALID", count: 1 },
+        ]);
     });
 });
 
@@ -328,17 +500,11 @@ describe("buildBreadcrumb", () => {
         expect(buildBreadcrumb(survey, surveyRec, byKey, recordIndex)).toBe("Kenya PPS 2024");
     });
 
-    it("falls back to the raw id and reports an orphan when the parent is missing", () => {
+    it("falls back to the raw id when the parent is missing", () => {
         const orphan = record({ id: "U2", label: "D28-orphan", parentId: "MISSING" });
         const { byKey, recordIndex } = indexOf(all);
-        const report = emptyIntegrityReport();
 
-        const path = buildBreadcrumb(followUp, orphan, byKey, recordIndex, report);
-
-        expect(path).toBe("MISSING > D28-orphan");
-        expect(report.orphans).toEqual([
-            { formKey: "FollowUpD28", recordId: "U2", missingParentId: "MISSING" },
-        ]);
+        expect(buildBreadcrumb(followUp, orphan, byKey, recordIndex)).toBe("MISSING > D28-orphan");
     });
 
     it("stops cleanly when a record has no parent id", () => {
@@ -420,8 +586,18 @@ describe("buildTrackerRecords", () => {
                 trackedEntity: "F1",
                 orgUnit: "OU_A",
                 events: [
-                    { event: "W1", programStage: "WARD", occurredAt: "2024-01-01", dataValues: [{ dataElement: "de2", value: "ICU" }] },
-                    { event: "W2", programStage: "WARD", occurredAt: "2024-02-01", dataValues: [{ dataElement: "de2", value: "ER" }] },
+                    {
+                        event: "W1",
+                        programStage: "WARD",
+                        occurredAt: "2024-01-01",
+                        dataValues: [{ dataElement: "de2", value: "ICU" }],
+                    },
+                    {
+                        event: "W2",
+                        programStage: "WARD",
+                        occurredAt: "2024-02-01",
+                        dataValues: [{ dataElement: "de2", value: "ER" }],
+                    },
                 ],
             },
             form({ key: "Facility" }),
@@ -436,7 +612,11 @@ describe("buildTrackerRecords", () => {
 
         expect(stageRecords).toHaveLength(2);
         expect(stageRecords[0]).toMatchObject({ stageId: "WARD" });
-        expect(stageRecords[0]!.record).toMatchObject({ id: "W1", parentId: "F1", label: "2024-01-01" });
+        expect(stageRecords[0]!.record).toMatchObject({
+            id: "W1",
+            parentId: "F1",
+            label: "2024-01-01",
+        });
         expect(stageRecords[1]!.record).toMatchObject({ id: "W2", parentId: "F1" });
         expect(stageRecords[0]!.record.values.get("de2")).toBe("ICU");
         expect(stageRecords[1]!.record.values.get("de2")).toBe("ER");
@@ -444,7 +624,9 @@ describe("buildTrackerRecords", () => {
     });
 
     it("copies the main row's surveyId onto repeatable-stage child records", () => {
-        const meta = programMeta({ stages: [stage({ id: "WARD", name: "Ward", repeatable: true })] });
+        const meta = programMeta({
+            stages: [stage({ id: "WARD", name: "Ward", repeatable: true })],
+        });
 
         const { stageRecords } = buildTrackerRecords(
             {
@@ -468,7 +650,13 @@ describe("buildTrackerRecords", () => {
             buildTrackerRecords(
                 {
                     trackedEntity: "C1",
-                    events: [{ event: "E1", programStage: "UNKNOWN", dataValues: [{ dataElement: "de1", value: "x" }] }],
+                    events: [
+                        {
+                            event: "E1",
+                            programStage: "UNKNOWN",
+                            dataValues: [{ dataElement: "de1", value: "x" }],
+                        },
+                    ],
                 },
                 caseReport,
                 meta,
@@ -480,14 +668,27 @@ describe("buildTrackerRecords", () => {
 
     it("skips a dataValue with an undefined or null value", () => {
         const meta = programMeta({
-            stages: [stage({ id: "S1", name: "S1", repeatable: false, dataElementLabels: new Map([["de1", "X"]]) })],
+            stages: [
+                stage({
+                    id: "S1",
+                    name: "S1",
+                    repeatable: false,
+                    dataElementLabels: new Map([["de1", "X"]]),
+                }),
+            ],
         });
         const columns = new Map<string, string>();
 
         const { main } = buildTrackerRecords(
             {
                 trackedEntity: "C1",
-                events: [{ event: "E1", programStage: "S1", dataValues: [{ dataElement: "de1", value: null }] }],
+                events: [
+                    {
+                        event: "E1",
+                        programStage: "S1",
+                        dataValues: [{ dataElement: "de1", value: null }],
+                    },
+                ],
             },
             caseReport,
             meta,
@@ -503,7 +704,11 @@ describe("buildTrackerRecords", () => {
 describe("keyColumnsFor (repeatable-stage children)", () => {
     it("does not duplicate Facility_id when a repeatable stage belongs to Facility itself", () => {
         const facility = form({ key: "Facility" });
-        const wardStage = form({ key: "Facility_WardData", kind: "trackerStage", parentKey: "Facility" });
+        const wardStage = form({
+            key: "Facility_WardData",
+            kind: "trackerStage",
+            parentKey: "Facility",
+        });
         const all: FormData[] = [
             { form: facility, records: [], columns: new Map() },
             { form: wardStage, records: [], columns: new Map() },
@@ -518,7 +723,11 @@ describe("keyColumnsFor (repeatable-stage children)", () => {
 
     it("gives a repeatable stage under Case report Survey_id, Facility_id and CaseReport_id", () => {
         const { survey, facility, caseReport } = realGraphForms();
-        const stageForm = form({ key: "CaseReport_Diagnosis", kind: "trackerStage", parentKey: "CaseReport" });
+        const stageForm = form({
+            key: "CaseReport_Diagnosis",
+            kind: "trackerStage",
+            parentKey: "CaseReport",
+        });
         const all: FormData[] = [survey, facility, caseReport, stageForm].map(f => ({
             form: f,
             records: [],
@@ -608,7 +817,10 @@ describe("assignSheetNames", () => {
     });
 
     it("never assigns a name that collides with a reserved name", () => {
-        const names = assignSheetNames([{ key: "_index", stableId: "weird-form-uid" }], ["_index", "_relationships"]);
+        const names = assignSheetNames(
+            [{ key: "_index", stableId: "weird-form-uid" }],
+            ["_index", "_relationships"]
+        );
         expect(names.get("_index")).not.toBe("_index");
     });
 
@@ -632,7 +844,9 @@ describe("assignStageChildKey", () => {
 
     it("builds a readable, word-boundary-preserving key", () => {
         const used = new Set<string>(["Facility"]);
-        expect(assignStageChildKey("Facility", repeatable("WARD", "Ward data"), used)).toBe("Facility__WardData");
+        expect(assignStageChildKey("Facility", repeatable("WARD", "Ward data"), used)).toBe(
+            "Facility__WardData"
+        );
     });
 
     it("disambiguates two stages that pascalize to the same name using the stage id, deterministically", () => {
@@ -728,7 +942,7 @@ describe("column order and header uniqueness", () => {
             new Map()
         );
 
-        const ordered = finalizeColumns(columns, meta);
+        const ordered = uniqueLabels(orderColumns(columns, meta));
 
         expect([...ordered.values()]).toEqual([
             "Species 1: Specify the species",
@@ -765,11 +979,67 @@ describe("column order and header uniqueness", () => {
             new Map()
         );
 
-        const ordered = finalizeColumns(columns, meta);
+        const ordered = uniqueLabels(orderColumns(columns, meta));
         const row = [...ordered.keys()].map(key => main.values.get(key) ?? "");
 
         // Antibiotic 1 is R; antibiotic 2 is S. Neither drug has two AST results.
         expect(row).toEqual(["Teicoplanin", "R", "Ceftriaxone", "S"]);
+    });
+
+    it("places the free-text 'Species, other' directly after its species", () => {
+        const labels = new Map([
+            ["species", "Specify the species"],
+            ["abx1", "Specify the antibiotic"],
+            ["ast1", "AST results"],
+            ["other", "Species, other"],
+        ]);
+        const order = new Map([
+            ["species", 0],
+            ["abx1", 1],
+            ["ast1", 2],
+            ["other", 121],
+        ]);
+        const meta = programMeta({
+            stages: [
+                stage({
+                    id: "S",
+                    name: "Species 1",
+                    dataElementLabels: labels,
+                    dataElementOrder: order,
+                }),
+            ],
+        });
+        placeSpeciesOtherAfterSpecies(labels, order);
+
+        const columns = new Map([
+            ["stage:other", "Species 1: Species, other"],
+            ["stage:ast1", "Species 1: AST results"],
+            ["stage:abx1", "Species 1: Specify the antibiotic"],
+            ["stage:species", "Species 1: Specify the species"],
+        ]);
+
+        expect([...uniqueLabels(orderColumns(columns, meta)).values()]).toEqual([
+            "Species 1: Specify the species",
+            "Species 1: Species, other",
+            "Species 1: Specify the antibiotic",
+            "Species 1: AST results",
+        ]);
+    });
+
+    it("leaves a stage without both species fields untouched", () => {
+        const labels = new Map([
+            ["species", "Specify the species"],
+            ["abx1", "Specify the antibiotic"],
+        ]);
+        const order = new Map([
+            ["species", 0],
+            ["abx1", 1],
+        ]);
+        placeSpeciesOtherAfterSpecies(labels, order);
+        expect([...order.entries()]).toEqual([
+            ["species", 0],
+            ["abx1", 1],
+        ]);
     });
 
     it("numbers repeats in form order when sections do not disambiguate them", () => {
@@ -782,7 +1052,14 @@ describe("column order and header uniqueness", () => {
             ["b", 2],
         ]);
         const meta = programMeta({
-            stages: [stage({ id: "S", name: "Ward data", dataElementLabels: labels, dataElementOrder: order })],
+            stages: [
+                stage({
+                    id: "S",
+                    name: "Ward data",
+                    dataElementLabels: labels,
+                    dataElementOrder: order,
+                }),
+            ],
         });
 
         const columns = new Map([
@@ -790,7 +1067,7 @@ describe("column order and header uniqueness", () => {
             ["a", "Ward data: Please, specify"],
         ]);
 
-        expect([...finalizeColumns(columns, meta).entries()]).toEqual([
+        expect([...uniqueLabels(orderColumns(columns, meta)).entries()]).toEqual([
             ["a", "Ward data: Please, specify #1"],
             ["b", "Ward data: Please, specify #2"],
         ]);
@@ -808,7 +1085,7 @@ describe("column order and header uniqueness", () => {
             ],
         });
 
-        const ordered = finalizeColumns(new Map([["a", "Stage: Ward name"]]), meta);
+        const ordered = uniqueLabels(orderColumns(new Map([["a", "Stage: Ward name"]]), meta));
         expect([...ordered.values()]).toEqual(["Stage: Ward name"]);
     });
 
@@ -832,7 +1109,11 @@ describe("column order and header uniqueness", () => {
             ["attr", "Patient id"],
         ]);
 
-        expect([...finalizeColumns(columns, meta).keys()]).toEqual(["attr", "stage:de", "orphaned"]);
+        expect([...uniqueLabels(orderColumns(columns, meta)).keys()]).toEqual([
+            "attr",
+            "stage:de",
+            "orphaned",
+        ]);
     });
 });
 
@@ -841,7 +1122,14 @@ describe("buildTrackerRecords: events across all enrolments", () => {
         // fetchTracker flattens enrollments[].events before calling this, so a TEI with a
         // second enrolment must not lose that enrolment's events from the extract.
         const meta = programMeta({
-            stages: [stage({ id: "WARD", name: "Ward data", repeatable: true, dataElementLabels: new Map() })],
+            stages: [
+                stage({
+                    id: "WARD",
+                    name: "Ward data",
+                    repeatable: true,
+                    dataElementLabels: new Map(),
+                }),
+            ],
         });
         const stageColumns = new Map<string, Map<string, string>>();
 
@@ -889,7 +1177,13 @@ describe("buildTrackerRecords: unresolved-stage diagnostics", () => {
         buildTrackerRecords(
             {
                 trackedEntity: "C1",
-                events: [{ event: "E1", programStage: "UNKNOWN", dataValues: [{ dataElement: "de1", value: "x" }] }],
+                events: [
+                    {
+                        event: "E1",
+                        programStage: "UNKNOWN",
+                        dataValues: [{ dataElement: "de1", value: "x" }],
+                    },
+                ],
             },
             form({ key: "CaseReport" }),
             meta,
@@ -898,7 +1192,9 @@ describe("buildTrackerRecords: unresolved-stage diagnostics", () => {
             report
         );
 
-        expect(report.unresolvedStageEvents).toEqual([{ formKey: "CaseReport", programStage: "UNKNOWN", count: 1 }]);
+        expect(report.unresolvedStageEvents).toEqual([
+            { formKey: "CaseReport", programStage: "UNKNOWN", count: 1 },
+        ]);
     });
 
     it("does not double-count the same unresolved event across the two internal passes", () => {
@@ -928,10 +1224,26 @@ describe("buildTrackerRecords: unresolved-stage diagnostics", () => {
             events: [{ event: `E-${id}`, programStage: "UNKNOWN", dataValues: [] }],
         });
 
-        buildTrackerRecords(teiInput("C1"), form({ key: "CaseReport" }), meta, new Map(), new Map(), report);
-        buildTrackerRecords(teiInput("C2"), form({ key: "CaseReport" }), meta, new Map(), new Map(), report);
+        buildTrackerRecords(
+            teiInput("C1"),
+            form({ key: "CaseReport" }),
+            meta,
+            new Map(),
+            new Map(),
+            report
+        );
+        buildTrackerRecords(
+            teiInput("C2"),
+            form({ key: "CaseReport" }),
+            meta,
+            new Map(),
+            new Map(),
+            report
+        );
 
-        expect(report.unresolvedStageEvents).toEqual([{ formKey: "CaseReport", programStage: "UNKNOWN", count: 2 }]);
+        expect(report.unresolvedStageEvents).toEqual([
+            { formKey: "CaseReport", programStage: "UNKNOWN", count: 2 },
+        ]);
     });
 
     it("does not record anything when every stage resolves", () => {
@@ -951,156 +1263,281 @@ describe("buildTrackerRecords: unresolved-stage diagnostics", () => {
     });
 });
 
-describe("buildTrackerRecords: header label resolution (tiers 1-2)", () => {
-    it("resolves a stage dataElement's label from its own stage config (tier 1)", () => {
+describe("buildTrackerRecords: column labels and fields no longer on the form", () => {
+    it("labels a stage dataElement from its own stage config", () => {
         const meta = programMeta({
-            stages: [stage({ id: "S1", name: "Diagnosis", dataElementLabels: new Map([["de1", "Primary site"]]) })],
+            stages: [
+                stage({
+                    id: "S1",
+                    name: "Diagnosis",
+                    dataElementLabels: new Map([["de1", "Primary site"]]),
+                }),
+            ],
         });
         const columns = new Map<string, string>();
+        const offForm: OffFormTracker = new Map();
 
         buildTrackerRecords(
-            { trackedEntity: "C1", events: [{ event: "E1", programStage: "S1", dataValues: [{ dataElement: "de1", value: "Lung" }] }] },
-            form({ key: "CaseReport" }),
-            meta,
-            columns,
-            new Map()
-        );
-
-        expect(columns.get("stage:de1")).toBe("Diagnosis: Primary site");
-    });
-
-    it("falls back to the program's flat dataElement list when the stage config lacks the label (tier 2)", () => {
-        // Live-verified real scenario: a dataElement removed from a stage's current config
-        // but still holding historical values, still present in the program's flat list.
-        const meta = programMeta({
-            stages: [stage({ id: "S1", name: "Diagnosis", dataElementLabels: new Map() })], // empty: not in stage config
-            dataElements: new Map([["de1", "Rescued From Flat List"]]),
-        });
-        const columns = new Map<string, string>();
-        const unresolvedHeaders = undefined; // must not be required for tier 2 to work
-
-        buildTrackerRecords(
-            { trackedEntity: "C1", events: [{ event: "E1", programStage: "S1", dataValues: [{ dataElement: "de1", value: "Lung" }] }] },
+            {
+                trackedEntity: "C1",
+                events: [
+                    {
+                        event: "E1",
+                        programStage: "S1",
+                        dataValues: [{ dataElement: "de1", value: "Lung" }],
+                    },
+                ],
+            },
             form({ key: "CaseReport" }),
             meta,
             columns,
             new Map(),
             undefined,
-            unresolvedHeaders
+            offForm
         );
 
-        expect(columns.get("stage:de1")).toBe("Diagnosis: Rescued From Flat List");
+        expect(columns.get("stage:de1")).toBe("Diagnosis: Primary site");
+        expect(offForm.size).toBe(0);
     });
 
-    it("resolves a repeatable-stage child column the same way (stage config, then flat list)", () => {
+    it("keeps a value whose field is no longer on its stage and notes it, counting every value", () => {
+        const sortOrder = 2;
+        const meta = programMeta({ stages: [stage({ id: "S1", name: "Diagnosis", sortOrder })] });
+        const columns = new Map<string, string>();
+        const offForm: OffFormTracker = new Map();
+        const tei = (id: string) => ({
+            trackedEntity: id,
+            events: [
+                {
+                    event: `E-${id}`,
+                    programStage: "S1",
+                    dataValues: [{ dataElement: "oldDE", value: "IV" }],
+                },
+            ],
+        });
+
+        for (const id of ["C1", "C2"]) {
+            const { main } = buildTrackerRecords(
+                tei(id),
+                form({ key: "CaseReport" }),
+                meta,
+                columns,
+                new Map(),
+                undefined,
+                offForm
+            );
+            expect(main.values.get("stage:oldDE")).toBe("IV");
+        }
+
+        expect(columns.get("stage:oldDE")).toBe("Diagnosis: oldDE"); // placeholder until labelled
+        const field = offForm.get("")?.get("stage:oldDE");
+        expect(field).toMatchObject({
+            kind: "dataElement",
+            id: "oldDE",
+            prefix: "Diagnosis: ",
+            values: 2,
+        });
+        // After every field of its own stage, before the next stage's fields.
+        expect(field!.position).toBe(1_000_000 * (2 + sortOrder) - 1);
+    });
+
+    it("notes an off-form field of a repeatable stage against that stage's sheet", () => {
         const meta = programMeta({
-            stages: [stage({ id: "WARD", name: "Ward data", repeatable: true, dataElementLabels: new Map() })],
-            dataElements: new Map([["de2", "Rescued Ward Field"]]),
+            stages: [stage({ id: "WARD", name: "Ward data", repeatable: true })],
         });
         const stageColumns = new Map<string, Map<string, string>>();
+        const offForm: OffFormTracker = new Map();
 
         buildTrackerRecords(
             {
                 trackedEntity: "F1",
-                events: [{ event: "W1", programStage: "WARD", dataValues: [{ dataElement: "de2", value: "ICU" }] }],
+                events: [
+                    {
+                        event: "W1",
+                        programStage: "WARD",
+                        dataValues: [{ dataElement: "oldDE", value: "x" }],
+                    },
+                ],
             },
-            form({ key: "Facility" }),
-            meta,
-            new Map(),
-            stageColumns
-        );
-
-        expect(stageColumns.get("WARD")?.get("de2")).toBe("Rescued Ward Field");
-    });
-
-    it("resolves an attribute label from meta.attributes", () => {
-        const meta = programMeta({ attributes: new Map([["attr1", "Hospital name"]]) });
-        const columns = new Map<string, string>();
-
-        buildTrackerRecords(
-            { trackedEntity: "C1", attributes: [{ attribute: "attr1", value: "Nairobi" }] },
-            form({ key: "Facility" }),
-            meta,
-            columns,
-            new Map()
-        );
-
-        expect(columns.get("attr1")).toBe("Hospital name");
-    });
-});
-
-describe("buildTrackerRecords: header resolution tier-3 queueing", () => {
-    it("queues a mainStageDataElement patch when both tier 1 and 2 fail, and uses the raw id as a placeholder label", () => {
-        const meta = programMeta({ stages: [stage({ id: "S1", name: "Diagnosis", dataElementLabels: new Map() })] });
-        const columns = new Map<string, string>();
-        const tracker = { dataElementIds: new Set<string>(), attributeIds: new Set<string>(), patches: [] as any[] };
-
-        buildTrackerRecords(
-            { trackedEntity: "C1", events: [{ event: "E1", programStage: "S1", dataValues: [{ dataElement: "strayDE", value: "x" }] }] },
-            form({ key: "CaseReport" }),
-            meta,
-            columns,
-            new Map(),
-            undefined,
-            tracker
-        );
-
-        expect(columns.get("stage:strayDE")).toBe("Diagnosis: strayDE"); // placeholder until tier 3 runs
-        expect(tracker.dataElementIds.has("strayDE")).toBe(true);
-        expect(tracker.patches).toEqual([{ kind: "mainStageDataElement", id: "strayDE", stageName: "Diagnosis" }]);
-    });
-
-    it("queues a childStageDataElement patch (with the stage id, not the stage name) for a repeatable stage", () => {
-        const meta = programMeta({ stages: [stage({ id: "WARD", name: "Ward data", repeatable: true, dataElementLabels: new Map() })] });
-        const stageColumns = new Map<string, Map<string, string>>();
-        const tracker = { dataElementIds: new Set<string>(), attributeIds: new Set<string>(), patches: [] as any[] };
-
-        buildTrackerRecords(
-            { trackedEntity: "F1", events: [{ event: "W1", programStage: "WARD", dataValues: [{ dataElement: "strayDE2", value: "x" }] }] },
             form({ key: "Facility" }),
             meta,
             new Map(),
             stageColumns,
             undefined,
-            tracker
+            offForm
         );
 
-        expect(stageColumns.get("WARD")?.get("strayDE2")).toBe("strayDE2");
-        expect(tracker.patches).toEqual([{ kind: "childStageDataElement", id: "strayDE2", stageId: "WARD" }]);
+        expect(stageColumns.get("WARD")?.get("oldDE")).toBe("oldDE");
+        expect(offForm.get("WARD")?.get("oldDE")).toMatchObject({ prefix: "", values: 1 });
     });
 
-    it("queues an attribute patch when the attribute isn't in meta.attributes", () => {
-        const meta = programMeta();
+    it("labels an attribute from meta.attributes, and notes one the program no longer has", () => {
+        const meta = programMeta({ attributes: new Map([["attr1", "Hospital name"]]) });
         const columns = new Map<string, string>();
-        const tracker = { dataElementIds: new Set<string>(), attributeIds: new Set<string>(), patches: [] as any[] };
+        const offForm: OffFormTracker = new Map();
 
         buildTrackerRecords(
-            { trackedEntity: "C1", attributes: [{ attribute: "strayAttr", value: "x" }] },
+            {
+                trackedEntity: "C1",
+                attributes: [
+                    { attribute: "attr1", value: "Nairobi" },
+                    { attribute: "oldAttr", value: "x" },
+                ],
+            },
             form({ key: "Facility" }),
             meta,
             columns,
             new Map(),
             undefined,
-            tracker
+            offForm
         );
 
-        expect(columns.get("strayAttr")).toBe("strayAttr");
-        expect(tracker.attributeIds.has("strayAttr")).toBe(true);
-        expect(tracker.patches).toEqual([{ kind: "attribute", id: "strayAttr" }]);
+        expect(columns.get("attr1")).toBe("Hospital name");
+        expect(offForm.get("")?.get("oldAttr")).toMatchObject({
+            kind: "trackedEntityAttribute",
+            values: 1,
+        });
     });
 
-    it("queues nothing when no tracker is provided (optional, backward compatible)", () => {
-        const meta = programMeta({ stages: [stage({ id: "S1", name: "Diagnosis", dataElementLabels: new Map() })] });
+    it("does not need a tracker", () => {
+        const meta = programMeta({ stages: [stage({ id: "S1", name: "Diagnosis" })] });
 
         expect(() =>
             buildTrackerRecords(
-                { trackedEntity: "C1", events: [{ event: "E1", programStage: "S1", dataValues: [{ dataElement: "strayDE", value: "x" }] }] },
+                {
+                    trackedEntity: "C1",
+                    events: [
+                        {
+                            event: "E1",
+                            programStage: "S1",
+                            dataValues: [{ dataElement: "oldDE", value: "x" }],
+                        },
+                    ],
+                },
                 form({ key: "CaseReport" }),
                 meta,
                 new Map(),
                 new Map()
             )
         ).not.toThrow();
+    });
+});
+
+describe("orderColumns with off-form fields", () => {
+    it("puts off-form columns after their stage's fields, in natural label order", () => {
+        const s1 = stage({
+            id: "S1",
+            name: "S1",
+            sortOrder: 0,
+            dataElementOrder: new Map([["a", 0]]),
+        });
+        const s2 = stage({
+            id: "S2",
+            name: "S2",
+            sortOrder: 1,
+            dataElementOrder: new Map([["b", 0]]),
+        });
+        const meta = programMeta({ stages: [s1, s2] });
+        const off = (id: string) => ({
+            kind: "dataElement" as const,
+            id,
+            position: 1_000_000 * 2 - 1,
+            prefix: "S1: ",
+            values: 1,
+        });
+
+        const ordered = orderColumns(
+            new Map([
+                ["stage:b", "S2: b"],
+                ["stage:r10", "S1: Route10 [not on current form]"],
+                ["stage:a", "S1: a"],
+                ["stage:r2", "S1: Route2 [not on current form]"],
+            ]),
+            meta,
+            new Map([
+                ["stage:r10", off("r10")],
+                ["stage:r2", off("r2")],
+            ])
+        );
+
+        expect([...ordered.keys()]).toEqual(["stage:a", "stage:r2", "stage:r10", "stage:b"]);
+    });
+});
+
+describe("fetchAllPages", () => {
+    const page = (from: number, count: number) =>
+        Array.from({ length: count }, (_, i) => ({ id: `r${from + i}` }));
+    const id = (r: { id: string }) => r.id;
+
+    it("requests every known page at once and keeps page order", async () => {
+        const requested: number[] = [];
+        const fetchPage = async (n: number) => {
+            requested.push(n);
+            await new Promise(resolve => setTimeout(resolve, n === 1 ? 20 : 1)); // page 1 finishes last
+            return n === 3 ? page(20, 5) : page((n - 1) * 10, 10);
+        };
+
+        const items = await fetchAllPages("F", 10, 25, fetchPage, id);
+
+        expect(requested.slice(0, 3).sort()).toEqual([1, 2, 3]);
+        expect(items.map(id)).toEqual(page(0, 25).map(id));
+    });
+
+    it("reads on past the known pages when records were added since discovery", async () => {
+        const pages: Record<number, { id: string }[]> = {
+            1: page(0, 10),
+            2: page(10, 10),
+            3: page(20, 3),
+        };
+        const items = await fetchAllPages("F", 10, 20, async n => pages[n] ?? [], id);
+
+        expect(items).toHaveLength(23);
+    });
+
+    it("reads page by page without a total, and drops a record repeated across pages", async () => {
+        const pages: Record<number, { id: string }[]> = {
+            1: page(0, 10),
+            2: [...page(9, 1), ...page(10, 4)],
+        };
+        const items = await fetchAllPages("F", 10, undefined, async n => pages[n] ?? [], id);
+
+        expect(items.map(id)).toEqual(page(0, 14).map(id));
+    });
+});
+
+describe("createLimiter", () => {
+    it("never runs more than the limit at once, and runs everything", async () => {
+        const limit = createLimiter(2);
+        let active = 0;
+        let peak = 0;
+
+        const results = await Promise.all(
+            [5, 1, 3, 1, 2].map(ms =>
+                limit(async () => {
+                    active++;
+                    peak = Math.max(peak, active);
+                    await new Promise(resolve => setTimeout(resolve, ms));
+                    active--;
+                    return ms;
+                })
+            )
+        );
+
+        expect(peak).toBe(2);
+        expect(results).toEqual([5, 1, 3, 1, 2]);
+    });
+
+    it("frees the slot of a failed task", async () => {
+        const limit = createLimiter(1);
+        await expect(limit(async () => Promise.reject(new Error("boom")))).rejects.toThrow("boom");
+        await expect(limit(async () => "next")).resolves.toBe("next");
+    });
+});
+
+describe("toCellValue: precision", () => {
+    it("keeps numbers longer than Excel's 15 digits as text", () => {
+        expect(toCellValue("1234567890123456", "NUMBER")).toBe("1234567890123456");
+        expect(toCellValue("123456789012345", "NUMBER")).toBe(123456789012345);
     });
 });
 
@@ -1114,22 +1551,24 @@ describe("computeColumnCount", () => {
         }));
         const byKey = new Map(all.map(d => [d.form.key, d]));
 
-        // FollowUpD28: 3 key cols (Survey_id, Facility_id, CaseReport_id) + 4 fixed
-        // (path, record_id, org_unit_id, org_unit_name) + metaKeyCount + valueColumnCount.
+        // FollowUpD28: 3 key cols (Survey_id, Facility_id, CaseReport_id) + 6 fixed (flag,
+        // flag_detail, path, record_id, org_unit_id, org_unit_name) + metaKeyCount + valueColumnCount.
         const columns = computeColumnCount(followUp, byKey, 4, 6);
-        expect(columns).toBe(3 + 4 + 4 + 6);
+        expect(columns).toBe(3 + 6 + 4 + 6);
     });
 
     it("gives Survey (root, no ancestors) just fixed + meta + value columns", () => {
         const { survey } = realGraphForms();
         const byKey = new Map([[survey.key, { form: survey, records: [], columns: new Map() }]]);
 
-        expect(computeColumnCount(survey, byKey, 4, 269)).toBe(0 + 4 + 4 + 269);
+        expect(computeColumnCount(survey, byKey, 4, 269)).toBe(0 + 6 + 4 + 269);
     });
 });
 
 describe("forecastWorkbook", () => {
-    function discoveryFor(overrides: Partial<FormDiscovery> & { form: ResolvedForm }): FormDiscovery {
+    function discoveryFor(
+        overrides: Partial<FormDiscovery> & { form: ResolvedForm }
+    ): FormDiscovery {
         return { stages: [], ...overrides };
     }
 
@@ -1168,7 +1607,9 @@ describe("forecastWorkbook", () => {
     });
 
     it("does not warn for a modestly sized sheet", () => {
-        const discoveries: FormDiscovery[] = [discoveryFor({ form: form({ key: "Facility" }), total: 40, columns: 51 })];
+        const discoveries: FormDiscovery[] = [
+            discoveryFor({ form: form({ key: "Facility" }), total: 40, columns: 51 }),
+        ];
 
         expect(forecastWorkbook(discoveries).warnings).toEqual([]);
     });
@@ -1207,8 +1648,20 @@ describe("forecastWorkbook", () => {
                 total: 40,
                 columns: 51,
                 stages: [
-                    { sheetKey: "Facility__EmptyStage", stageName: "Empty", parentFormKey: "Facility", rows: 0, columns: 10 },
-                    { sheetKey: "Facility__WardData", stageName: "Ward data", parentFormKey: "Facility", rows: 5, columns: 230 },
+                    {
+                        sheetKey: "Facility__EmptyStage",
+                        stageName: "Empty",
+                        parentFormKey: "Facility",
+                        rows: 0,
+                        columns: 10,
+                    },
+                    {
+                        sheetKey: "Facility__WardData",
+                        stageName: "Ward data",
+                        parentFormKey: "Facility",
+                        rows: 5,
+                        columns: 230,
+                    },
                 ],
             }),
         ];
@@ -1219,7 +1672,9 @@ describe("forecastWorkbook", () => {
     });
 
     it("leaves cells undefined (not zero) when rows or columns aren't known, rather than under-forecasting", () => {
-        const discoveries: FormDiscovery[] = [discoveryFor({ form: form({ key: "WardSummaryStats", kind: "dataSet" }) })];
+        const discoveries: FormDiscovery[] = [
+            discoveryFor({ form: form({ key: "WardSummaryStats", kind: "dataSet" }) }),
+        ];
 
         const forecast = forecastWorkbook(discoveries);
 
@@ -1233,5 +1688,337 @@ describe("formatBytes", () => {
         expect(formatBytes(500)).toBe("500 B");
         expect(formatBytes(5 * 1024 * 1024)).toBe("5.0 MB");
         expect(formatBytes(2 * 1024 * 1024 * 1024)).toBe("2.00 GB");
+    });
+});
+
+describe("candidateProgramIds", () => {
+    const modules = [
+        {
+            customForms: {
+                SURVEY_A: { DEFAULT_CRF: "CUSTOM_CRF", DEFAULT_ECON: "" },
+                SURVEY_B: { DEFAULT_CRF: "CUSTOM_CRF" },
+            },
+        },
+        { customForms: { SURVEY_C: { DEFAULT_CRF: "CUSTOM_CRF_V2" } } },
+        {},
+    ] as unknown as AMRSurveyModule[];
+
+    it("returns the default program followed by every distinct custom variant", () => {
+        expect(candidateProgramIds("DEFAULT_CRF", modules)).toEqual([
+            "DEFAULT_CRF",
+            "CUSTOM_CRF",
+            "CUSTOM_CRF_V2",
+        ]);
+    });
+
+    it("returns just the default when no survey customises it, ignoring empty mappings", () => {
+        expect(candidateProgramIds("DEFAULT_ECON", modules)).toEqual(["DEFAULT_ECON"]);
+        expect(candidateProgramIds("DEFAULT_OTHER", modules)).toEqual(["DEFAULT_OTHER"]);
+    });
+});
+
+describe("mergeByFormKey", () => {
+    const defaultProgram = form({ key: "CaseReport", uid: "DEF", serverName: "Case report form" });
+    const customProgram = form({
+        key: "CaseReport",
+        uid: "CUS",
+        serverName: "Case report form - custom v1",
+        isCustom: true,
+        parentLinkField: "LINK",
+    });
+
+    it("stacks the programs' rows into one sheet and unions the columns, default first", () => {
+        const merged = mergeByFormKey([
+            {
+                form: defaultProgram,
+                records: [record({ id: "A" })],
+                columns: new Map([
+                    ["a", "Age"],
+                    ["b", "Sex"],
+                ]),
+                valueTypes: new Map([["a", "INTEGER"]]),
+            },
+            { form: form({ key: "Survey" }), records: [record({ id: "S" })], columns: new Map() },
+            {
+                form: customProgram,
+                records: [record({ id: "B" })],
+                columns: new Map([
+                    ["b", "Sex (renamed)"],
+                    ["c", "Ward"],
+                ]),
+                valueTypes: new Map([["c", "TEXT"]]),
+            },
+        ]);
+
+        expect(merged.map(d => d.form.key)).toEqual(["CaseReport", "Survey"]);
+        const crf = merged[0]!;
+        expect(crf.records.map(r => r.id)).toEqual(["A", "B"]);
+        expect([...crf.columns.entries()]).toEqual([
+            ["a", "Age"],
+            ["b", "Sex"],
+            ["c", "Ward"],
+        ]);
+        expect([...crf.valueTypes!.keys()]).toEqual(["a", "c"]);
+        expect(crf.form.serverName).toBe("Case report form; Case report form - custom v1");
+        expect(crf.form.uid).toBe("DEF; CUS");
+        expect(crf.form.isCustom).toBe(true);
+    });
+
+    it("leaves a form backed by one program untouched", () => {
+        const only = {
+            form: defaultProgram,
+            records: [record({ id: "A" })],
+            columns: new Map([["a", "Age"]]),
+        };
+        expect(mergeByFormKey([only])).toEqual([only]);
+    });
+});
+
+describe("expectedRecordCounts", () => {
+    const def = form({ key: "CaseReport", uid: "DEF" });
+    const custom = form({ key: "CaseReport", uid: "CUS", isCustom: true });
+    const survey = form({ key: "Survey", uid: "SUR" });
+
+    it("sums the discovered totals of a form's extracted programs", () => {
+        const totals = new Map([
+            ["DEF", 4475],
+            ["CUS", 12],
+            ["SUR", 4],
+        ]);
+        expect(expectedRecordCounts([def, custom, survey], totals)).toEqual(
+            new Map([
+                ["CaseReport", 4487],
+                ["Survey", 4],
+            ])
+        );
+    });
+
+    it("leaves a form out when any of its programs has no known total", () => {
+        const totals = new Map<string, number | undefined>([
+            ["DEF", 10],
+            ["CUS", undefined],
+        ]);
+        expect(expectedRecordCounts([def, custom], totals).has("CaseReport")).toBe(false);
+    });
+
+    it("adds the probed rows of repeatable-stage sheets, summed across programs", () => {
+        const stageOf = (form: ResolvedForm, rows: number) => ({
+            form,
+            total: 1,
+            stages: [
+                {
+                    sheetKey: "CaseReport__Ward",
+                    stageName: "Ward",
+                    parentFormKey: "CaseReport",
+                    rows,
+                    columns: 9,
+                },
+            ],
+        });
+        const notExtracted = form({ key: "Other", uid: "OTH" });
+
+        const expected = expectedRecordCounts(
+            [def, custom],
+            new Map([
+                ["DEF", 1],
+                ["CUS", 1],
+            ]),
+            [stageOf(def, 223), stageOf(custom, 5), stageOf(notExtracted, 99)]
+        );
+
+        expect(expected.get("CaseReport__Ward")).toBe(228);
+    });
+});
+
+describe("toCellValue", () => {
+    it("turns numeric value types into numbers", () => {
+        expect(toCellValue("42", "INTEGER")).toBe(42);
+        expect(toCellValue("3.5", "NUMBER")).toBe(3.5);
+    });
+
+    it("keeps text, codes and unparseable values unchanged", () => {
+        expect(toCellValue("007", "TEXT")).toBe("007");
+        expect(toCellValue("007", undefined)).toBe("007");
+        expect(toCellValue("n/a", "INTEGER")).toBe("n/a");
+        expect(toCellValue("", "INTEGER")).toBe("");
+    });
+
+    it("turns dates into the same calendar date, whatever the local time zone", () => {
+        expect(toCellValue("2024-05-22", "DATE")).toEqual(new Date("2024-05-22T00:00:00Z"));
+        expect(toCellValue("2024-05-22T10:11:12.000", "DATETIME")).toEqual(
+            new Date("2024-05-22T10:11:12Z")
+        );
+        expect(toCellValue("not a date", "DATE")).toBe("not a date");
+    });
+});
+
+describe("buildTrackerRecords: option names and the program column", () => {
+    const meta = programMeta({
+        stages: [
+            stage({ id: "S1", name: "Stage", dataElementLabels: new Map([["ast", "AST result"]]) }),
+        ],
+        attributes: new Map([["attr", "Specimen"]]),
+        optionNames: new Map([
+            ["ast", new Map([["I", "Intermediate"]])],
+            ["attr", new Map([["BLD", "Blood"]])],
+        ]),
+    });
+
+    it("writes option names for option-set fields and leaves other values alone", () => {
+        const { main } = buildTrackerRecords(
+            {
+                trackedEntity: "T1",
+                attributes: [{ attribute: "attr", value: "BLD" }],
+                events: [
+                    {
+                        event: "E1",
+                        programStage: "S1",
+                        dataValues: [
+                            { dataElement: "ast", value: "I" },
+                            { dataElement: "free", value: "I" },
+                        ],
+                    },
+                ],
+            },
+            form({ key: "CentralRefLab" }),
+            meta,
+            new Map(),
+            new Map()
+        );
+
+        expect(main.values.get("attr")).toBe("Blood");
+        expect(main.values.get("stage:ast")).toBe("Intermediate");
+        expect(main.values.get("stage:free")).toBe("I");
+    });
+
+    it("keeps the stored code when the option is not in the set", () => {
+        const { main } = buildTrackerRecords(
+            { trackedEntity: "T1", attributes: [{ attribute: "attr", value: "UNKNOWN" }] },
+            form({ key: "CentralRefLab" }),
+            meta,
+            new Map(),
+            new Map()
+        );
+        expect(main.values.get("attr")).toBe("UNKNOWN");
+    });
+
+    it("stamps each row with the program it came from", () => {
+        const { main } = buildTrackerRecords(
+            { trackedEntity: "T1" },
+            form({ key: "CaseReport", serverName: "Case report form - custom v1" }),
+            meta,
+            new Map(),
+            new Map()
+        );
+        expect(main.meta.get("program")).toBe("Case report form - custom v1");
+    });
+});
+
+describe("buildTrackerRecords: second event on a single-entry stage", () => {
+    const meta = programMeta({ stages: [stage({ id: "S1", name: "Species 1" })] });
+    const event = (id: string, value?: string) => ({
+        event: id,
+        programStage: "S1",
+        dataValues: value ? [{ dataElement: "de", value }] : [],
+    });
+
+    it("counts a second event with data, since its values overwrite the first's", () => {
+        const report = emptyIntegrityReport();
+        const { main } = buildTrackerRecords(
+            { trackedEntity: "T1", events: [event("E1", "first"), event("E2", "second")] },
+            form({ key: "CentralRefLab" }),
+            meta,
+            new Map(),
+            new Map(),
+            report
+        );
+
+        expect(report.duplicateStageEvents).toEqual([
+            { formKey: "CentralRefLab", programStage: "S1", count: 1 },
+        ]);
+        expect(main.values.get("stage:de")).toBe("second");
+    });
+
+    it("does not count an empty second event, which loses nothing", () => {
+        const report = emptyIntegrityReport();
+        buildTrackerRecords(
+            { trackedEntity: "T1", events: [event("E1", "first"), event("E2")] },
+            form({ key: "CentralRefLab" }),
+            meta,
+            new Map(),
+            new Map(),
+            report
+        );
+
+        expect(report.duplicateStageEvents).toEqual([]);
+    });
+});
+
+describe("makePageGuard", () => {
+    const id = (item: { id: string }) => item.id;
+
+    it("drops records already seen on an earlier page", () => {
+        const fresh = makePageGuard("F");
+        expect(fresh([{ id: "a" }, { id: "b" }], id)).toEqual([{ id: "a" }, { id: "b" }]);
+        expect(fresh([{ id: "b" }, { id: "c" }], id)).toEqual([{ id: "c" }]);
+    });
+
+    it("signals a stop when a page adds nothing new, but not for an empty page", () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const fresh = makePageGuard("F");
+        fresh([{ id: "a" }], id);
+
+        expect(fresh([{ id: "a" }], id)).toBeUndefined();
+        expect(fresh([], id)).toEqual([]);
+        warn.mockRestore();
+    });
+});
+
+describe("mapWithConcurrency", () => {
+    it("keeps input order and never exceeds the limit", async () => {
+        let inFlight = 0;
+        let peak = 0;
+        const delays = [30, 5, 5, 5, 5, 5];
+
+        const results = await mapWithConcurrency(delays, 3, async ms => {
+            inFlight++;
+            peak = Math.max(peak, inFlight);
+            await new Promise(resolve => setTimeout(resolve, ms));
+            inFlight--;
+            return ms * 2;
+        });
+
+        expect(results).toEqual([60, 10, 10, 10, 10, 10]);
+        expect(peak).toBe(3);
+    });
+
+    it("lets a slow item hold up one slot, not the whole batch", async () => {
+        const log: string[] = [];
+        const items = [
+            { id: "slow", ms: 40 },
+            { id: "a", ms: 1 },
+            { id: "b", ms: 1 },
+        ];
+
+        await mapWithConcurrency(items, 2, async ({ id, ms }) => {
+            log.push(`start:${id}`);
+            await new Promise(resolve => setTimeout(resolve, ms));
+            log.push(`end:${id}`);
+        });
+
+        // Fixed batches of 2 would not start "b" until "slow" had finished.
+        expect(log.indexOf("start:b")).toBeLessThan(log.indexOf("end:slow"));
+    });
+
+    it("stops starting new items after a failure", async () => {
+        const started: number[] = [];
+        await expect(
+            mapWithConcurrency([1, 2, 3, 4, 5], 1, async n => {
+                started.push(n);
+                if (n === 2) throw new Error("boom");
+            })
+        ).rejects.toThrow("boom");
+
+        expect(started).toEqual([1, 2]);
     });
 });
