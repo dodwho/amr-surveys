@@ -143,8 +143,10 @@ Check the example script, entry `"script-example"`in `package.json`->scripts and
 #### Extracting form data (`extract-forms`)
 
 `src/scripts/extract-forms.ts` exports the Prevalence forms into a single Excel
-workbook: one sheet per form, plus an `_index` sheet (scope, counts, reconciliation,
-integrity findings) and a `_relationships` sheet (the machine-readable join contract).
+workbook: one sheet per form, plus three sheets of its own: **Read me** (how to read the
+workbook and how the sheets link, scope, counts, reconciliation, findings), **Column guide**
+(every column of every sheet and where it comes from) and **Joins (technical)** (the
+machine-readable join contract).
 It is **read-only** — it issues GET requests only and never writes to DHIS2.
 
 ##### Credentials
@@ -178,16 +180,17 @@ $ yarn extract-forms --country KEN --start-date 2024-01-01 --end-date 2024-12-31
 child sheets, with their own row/column counts — see below), record counts, min/max dates,
 a full workbook forecast (worksheet count, total cells, an estimated file size range, and
 warnings for unusually wide/large sheets), and the planned scope, then exits without writing
-anything. The forecast mirrors extraction's own skip rule exactly (a form or stage proven to
-have 0 records produces no sheet), so the sheet list `--discover` prints is the sheet list a
-real run will produce — not a superset of it.
+anything. The forecast uses extraction's own rule (`programsToExtract`): every form and every
+repeatable stage gets a sheet, empty or not, and a program proven to have 0 records is
+skipped unless it is the default program of a form with no data at all. So the sheet list
+`--discover` prints is the sheet list a real run will produce.
 
-The two ward statistics dataSets (`WardSummaryStats`: ward x specialty; `WardLevelStats`:
-ward only) are aggregate data. `--start-date` / `--end-date` apply to them only and default
+The two ward statistics dataSets (Ward summary statistics: ward x specialty; Ward level
+statistics: ward only) are aggregate data. `--start-date` / `--end-date` apply to them only and default
 to all periods (2000-01-01 to today); without `--country` / `--org-unit` they are read under
 the user's own root org units. The two share their data elements, so DHIS2 returns each
 one's values for both; every value is written once, on the sheet of the dataSet that owns
-its ward combo, and `_index` says how many were left to the other sheet.
+its ward combo, and Read me says how many were left to the other sheet.
 
 ##### Default and custom programs
 
@@ -195,46 +198,86 @@ A form is identified by its **default** program. A survey can use a custom varia
 (datastore `amr-surveys/modules` → `customForms`), so a country's data sits in whichever of
 the default and custom programs it used. For each form the script probes the default program
 and every custom variant under the requested scope, extracts those with data, and stacks
-them into **one sheet per form** with a `program` column saying which program each row came
-from. Columns are the union (the programs share almost all their data elements). The
-`_index` sheet lists every program behind each sheet, and reconciliation compares the sheet
+them into **one sheet per form** with a Form version column saying which program each row
+came from. Columns are the union (the programs share almost all their data elements). Read
+me lists every program behind each sheet, and reconciliation compares the sheet
 to the summed discovered counts.
 
 `--per-country` takes the countries from the Survey records and writes one workbook per
 country into `extracts/` (or the directory given by `--output`), then prints which programs
 each country used. It cannot be combined with `--country` / `--org-unit`.
 
+##### Sheet layout
+
+Every form sheet has the same four column groups, left to right, with coloured headers. Each
+header has a note saying where its value comes from, and the **Column guide** sheet lists
+every column of every sheet (group, form section, source, rows filled).
+
+| Group | Header colour | Columns |
+| ----- | ------------- | ------- |
+| Identification | blue | Survey name, Facility name (Country on the Survey sheet), Unique facility ID, Unique ward ID, Unique survey patient ID: only those that apply to the sheet. Frozen on screen. |
+| Data check | orange | Data check, Data check details (see below). Frozen on screen. |
+| Form questions | green / yellow bands, one per form section | Every question on the form, in form order, **answered or not**. A field already shown as identification or as a link is not repeated. |
+| DHIS2 linking and system | grey, collapsed (click `+`) | Record ID, the record IDs it links to, DHIS2 org unit ID, Date entered, Last changed, Enrolled on / Event date, Status, Form version. |
+
+Every form gets a sheet, even with no records, so workbooks always have the same sheets.
+
+**Identification columns** are the IDs the survey teams type. They nest: patient
+`HF025/W16/011` is in ward `HF025/W16`, in facility `HF025`, and are unique only within one
+survey. Values are trimmed; the form's own field, if any, is not repeated among the questions.
+
+| Column | Source |
+| ------ | ------ |
+| Survey name | Survey form SurveyName (`HXnhZ8rsDts`), looked up by Survey record ID. The form's SurveyID field is not filled in on prod. |
+| Facility name / Country | The DHIS2 org unit the record was entered under. |
+| Unique facility ID | Facility form: the field called "Hospital ID" (`hpNIfydqgkD`). Case report: Unique facility ID (`qgPNgq0Ws7k`). Forms below the case report: "(from case report)". Ward statistics: the Hospital ID of the Facility form at the same org unit. |
+| Unique ward ID | Facility form Ward data: Unique ward ID (`yAA33dsnWmY`). Case report: Unique ward/department ID (`KoKmhwZGJnW`). Forms below the case report: "(from case report)". Ward statistics: facility ID + `/` + the ward (`W16`). |
+| Unique survey patient ID | `yEkJlUFeJdP`, each record's own value. |
+
+A ward typed without its facility (`W16`) is shown in full (`HF025/W16`). IDs are compared
+ignoring case, spaces, leading zeros, a trailing slash and Cyrillic look-alike letters (`hf025/ w1` = `HF025/W01`,
+`HF025/` = `HF025`): on preprod most apparent mismatches were only that.
+
+**Headers.** Questions keep their form label (prefixed with the form section on tracker
+forms). Where two fields share a label, the header adds the field's DHIS2 name in brackets.
+A form's own copy of an identification field gets "(this form's own field)", e.g. the
+follow-up form's "Unique facility ID". The follow-up and discharge forms have a second
+patient ID field labelled exactly "Unique survey patient ID" in DHIS2 (`qsDC1eNnbgE`,
+`Cw0y6iIZ4nb`); it holds the patient ID, or the patient ID + `/C3` for cohort 3, so the
+extract heads it "Unique survey patient ID (this form's own field: ___ or ___/C3)".
+
 ##### What the cells contain
 
 - Option-set fields are written as the option **name** (the stored code if the option is unknown).
-- Numeric and date fields, and the `created_at`/`updated_at`/... timestamps, are real Excel
-  numbers and dates; everything else (including UIDs and codes) is text. Numbers longer than
-  Excel's 15 significant digits stay text so they are never rounded.
-- **Fields no longer on the form.** DHIS2 keeps values entered in fields later removed from
-  a form (thousands of antibiotic-history values on the Kyrgyz case reports, for example).
-  The app no longer shows them; the extract keeps them, after their stage's columns, headed
-  with the field's full DHIS2 name (which carries its slot, e.g. `Route1.1YES`) and marked
-  `[not on current form]`. `_index` lists them with their value counts.
+- Numeric and date fields, and the Date entered / Last changed / ... timestamps, are real
+  Excel numbers and dates; everything else (including ids and codes) is text. Numbers longer
+  than Excel's 15 significant digits stay text so they are never rounded.
+- **Questions no longer on the form.** DHIS2 keeps values entered in fields later removed
+  from a form (thousands of antibiotic-history values on the Kyrgyz case reports, for
+  example). The app no longer shows them; the extract keeps them, after their stage's
+  columns, headed with the field's full DHIS2 name (which carries its slot, e.g.
+  `Route1.1YES`) and marked `[not on current form]`. Read me lists them with their value counts.
 - Single-entry stages that had more than one event with data (the last event's values win),
-  skipped events and fields deleted from DHIS2 metadata are listed on `_index`.
+  skipped events and fields deleted from DHIS2 metadata are listed on Read me.
 
-##### Flagged records
+##### Data checks
 
-Columns A-B of every sheet, `flag` and `flag_detail`, say why a record needs a second look;
-flagged rows are also shaded orange, and every header has a filter. `_index` counts them
-per sheet and explains each flag:
+The Data check and Data check details columns say why a record needs a second look; such
+rows are also shaded orange, and every header has a filter. Read me counts them per sheet
+and explains each one:
 
-| Flag | Meaning |
-| ---- | ------- |
-| `TEST/INVALID` | Its Survey_id is missing or is not a survey in DHIS2 ("test", "TEST SURVEY ID"...) |
+| Data check | Meaning |
+| ---------- | ------- |
+| `TEST/INVALID` | Its survey link is missing or is not a survey in DHIS2 ("test", "TEST SURVEY ID"...) |
 | `PARENT DELETED` | The case report (or survey) it belongs to was deleted in DHIS2; this record was not |
 | `PARENT MISSING` | The record it belongs to does not exist in DHIS2, or no link was recorded |
 | `OUTSIDE EXTRACT` | The record it belongs to exists, but under another org unit |
-| `SURVEY MISMATCH` | Its own Survey_id differs from its parent's |
+| `SURVEY MISMATCH` | Its own survey link differs from its parent's |
 | `PARENT FLAGGED` | The record it belongs to is itself flagged (flags pass down to children) |
+| `ID MISMATCH` | Its typed IDs disagree: a case report's Unique facility ID vs the Facility form's, its ward vs that facility's wards, ward not starting with facility, patient not starting with ward; a form's patient ID vs its case report's; or a form's own patient ID field that is neither the patient ID nor the patient ID + `/C3`. Blanks are never a mismatch. Does not pass down to children (the DHIS2 links still hold). |
 
 Deleted and missing parents are told apart by looking the dangling ids up in DHIS2,
-deleted records included. Flagging never removes a record.
+deleted records included. A data check never removes a record.
 
 ##### Speed and load
 
@@ -246,55 +289,43 @@ streamed to disk (`<name>.xlsx.partial`, renamed when complete, so an interrupte
 leaves a file that looks finished). `--per-country` carries on past a failed country and
 exits non-zero at the end, naming it.
 
-##### Relationship specification
+##### Joins
 
-Every sheet's primary key is `record_id`. The workbook's `_relationships` sheet emits this
-same table at runtime for downstream tools.
+Every sheet's key is its **Record ID** column. The workbook's **Joins (technical)** sheet
+lists every join at runtime for downstream tools.
 
-| Sheet | Parent sheet | Parent key | Ancestor key columns | Cardinality |
-| ----- | ------------ | ---------- | -------------------- | ----------- |
-| `Survey` | (root) | — | — | root |
-| `Facility` | Survey | `Survey_id` (`Log2Y4uqBBo`) | `Survey_id` | Survey 1→N |
-| `CaseReport` | Survey | `Survey_id` (`tlRPoWumrSa`) | `Survey_id`, `Facility_id` | Survey 1→N |
-| `SampleShipment` | CaseReport | `CaseReport_id` (`mUaaSzbeMmj`) | `Survey_id`, `Facility_id`, `CaseReport_id` | CaseReport 1→N |
-| `CentralRefLab` | CaseReport | `CaseReport_id` (`mUaaSzbeMmj`) | idem | CaseReport 1→N |
-| `PathogenIsolates` | CaseReport | `CaseReport_id` (`M1D2XXokPWl`) | idem | CaseReport 1→N |
-| `Supranational` | CaseReport | `CaseReport_id` (`yq8en6ZkENB`) | idem | CaseReport 1→N |
-| `FollowUpD28` | CaseReport | `CaseReport_id` (`l4Y96YlhYyF`) | idem | CaseReport 1→N |
-| `DischargeClinical` | CaseReport | `CaseReport_id` (`oT6f0BG74xs`) | idem | CaseReport 1→0..N |
-| `DischargeEconomic` | CaseReport | `CaseReport_id` (`HkBG3DVELBM`) | idem | CaseReport 1→0..N |
-| `CohortEnrolment` | CaseReport | `CaseReport_id` (`mGYxog3at84`) | idem | CaseReport 1→0..N |
-| `WardSummaryStats` | (none) | — | `org_unit_id`, `Ward` | aggregate |
-| `WardLevelStats` | (none) | — | `org_unit_id`, `Ward` | aggregate |
+| Sheet | Belongs to | Linked by | Rows per parent |
+| ----- | ---------- | --------- | --------------- |
+| Survey | (top level) | — | — |
+| Facility | Survey | Survey record ID (`Log2Y4uqBBo`) | many per survey |
+| Facility - Ward data | Facility | Facility record ID | many per facility |
+| Case report | Survey | Survey record ID (`tlRPoWumrSa`) | many per survey |
+| Sample shipment, Central ref lab, Pathogen isolates, Supranational ref lab, Follow-up D28 | Case report | Case report record ID (`mUaaSzbeMmj`, `M1D2XXokPWl`, `yq8en6ZkENB`, `l4Y96YlhYyF`) | many per case report |
+| Discharge clinical, Discharge economic, Cohort enrolment | Case report | Case report record ID (`oT6f0BG74xs`, `HkBG3DVELBM`, `mGYxog3at84`) | none or more per case report |
+| Ward summary statistics, Ward level statistics | (none) | DHIS2 org unit ID, Unique ward ID | aggregate |
 
 **Case report links to Survey, not Facility.** This is not obvious from the UI's visual
 nesting, but it is what the app filters on: `GetPaginatedSurveysUseCase.ts` uses
 `parentPatientId` only for the 8 leaf forms (`isPrevalencePatientChild`) and
 `parentSurveyId` for Facility and Case report. So `tlRPoWumrSa` holds a **Survey** id.
-Case report has no foreign key to Facility at all — the UI scopes it by org unit.
+Case report has no link to Facility at all — the UI scopes it by org unit.
 
 Consequently:
 
--   `Survey_id` is read **directly** from each record's own survey-link attribute
-    (every leaf form carries one — see `parentPrevalenceSurveyIdList`), so every record
-    traces to its Survey without walking the chain.
--   `Facility_id` is **derived**: `Facility.record_id WHERE Facility.Survey_id = row.Survey_id
-    AND Facility.org_unit_id = row.org_unit_id`. Ambiguous or unresolvable matches are
-    reported in `_index` rather than silently guessed.
+-   Survey record ID is read **directly** from each record's own survey-link field (every
+    leaf form carries one — see `parentPrevalenceSurveyIdList`), so every record traces to
+    its survey without walking the chain.
+-   Facility record ID is **worked out**: the Facility row with the same Survey record ID
+    and DHIS2 org unit ID. Ambiguous or unresolvable matches are reported on Read me rather
+    than silently guessed.
+-   Ward record ID is **worked out** too, on Case report and every sheet below it: the
+    Facility - Ward data row with the same Facility record ID and Unique ward ID. Forms
+    below the case report copy their case report's. Case reports naming a ward that is not
+    on their facility's list are counted on Read me.
 
-Example join (SQL-ish):
-
-```sql
-SELECT f.*, c.Survey_id, fac.org_unit_name
-FROM   FollowUpD28 f
-JOIN   CaseReport  c   ON f.CaseReport_id = c.record_id
-JOIN   Facility    fac ON f.Facility_id   = fac.record_id
-JOIN   Survey      s   ON f.Survey_id     = s.record_id;
-```
-
-Sheets are flat tables with a single header row, stable snake_case keys and text-formatted
-ids, so they load directly into Power BI or a SQL loader as a star schema (`Survey` and
-`Facility` as dimensions, the leaf forms as facts).
+Sheets are flat tables with a single header row and text-formatted ids, so they load
+directly into Power BI or a SQL loader as a star schema (Survey and Facility as dimensions,
+the patient forms as facts).
 
 ##### Notes
 
@@ -303,9 +334,10 @@ ids, so they load directly into Power BI or a SQL loader as a star schema (`Surv
     (`amr-surveys` -> `modules` -> `customForms`) and so cannot be known from the
     code alone. The constants in `src/data/entities/D2Survey.ts` are used only as
     a cross-check, and a mismatch is reported as a warning.
--   Optimisation never narrows the result: the only forms skipped are those a probe proves
-    have **exactly zero** records, and a reconciliation check compares extracted counts
-    against the discovered totals, reporting any mismatch in `_index`.
+-   Optimisation never narrows the result: the only programs skipped are those a probe
+    proves have **exactly zero** records (their form still gets its sheet), and a
+    reconciliation check compares extracted counts against the discovered totals, reporting
+    any mismatch on Read me.
 -   `src/scripts/common.ts` is a deliberate port of glass-dev's script auth layer
     (PAT handling, `backend: "fetch"`, session warm-up, refresh + backoff). Keep the two
     in sync when either changes.
@@ -321,12 +353,10 @@ the enrollment's **program stages**. Both are extracted:
 -   A **repeatable** stage (e.g. Facility's "Ward data", which can occur many times per
     facility) becomes its **own child sheet** — one row per event — because a TEI can have
     many events for that stage, which is a different cardinality than the flat one-row-per-
-    record model everything else uses. Its sheet key is `<owning form>__<StageName>` in
-    PascalCase (e.g. `Facility__WardData` — word boundaries are preserved, not stripped, so
-    "Ward data" doesn't become the unreadable `Warddata`), and it carries the same ancestor
-    key columns as any other child sheet, plus `<owning form>_id` (deduplicated against an
-    already-present ancestor column of the same name where the owner IS that ancestor, e.g.
-    Facility's own repeatable stages don't get `Facility_id` twice).
+    record model everything else uses. Its sheet is named `<owning form> - <stage name>`
+    (e.g. "Facility - Ward data"), and it carries the same link columns as any other child
+    sheet, plus `<owning form> record ID` (except where the owner IS an ancestor already
+    linked, e.g. Facility's own repeatable stages don't get a second Facility record ID).
 
 This matters for completeness: on the AMR Surveys prevalence programs, the large majority of
 real fields live at the stage level, not as attributes (e.g. Case report currently has ~17
@@ -342,11 +372,12 @@ live dataset), sanitized, and truncated. If two different keys would truncate to
 31-char name — verified live: two `SampleShipment` stage names differing only after
 character 31 — the later one gets a short, stable disambiguation suffix derived from its own
 DHIS2 uid, not a running counter, so the same input metadata always produces the same output
-names. `_index` and `_relationships` are reserved so a form can never collide with them.
+names. Read me, Column guide and Joins (technical) are reserved so a form can never
+collide with them.
 
 Nothing fails silently: a resolved collision, an event on an unresolvable program stage
 (data that had to be skipped), an ambiguous Facility match, and a Survey/parent id mismatch
-are all counted and listed in the `_index` sheet's "Integrity findings" section, not just
+are all counted and listed in the Read me sheet's "Other findings" section, not just
 logged and forgotten.
 
 ### Misc Notes

@@ -1,27 +1,35 @@
 import {
     assignSheetNames,
     assignStageChildKey,
-    buildBreadcrumb,
     buildStageChildForm,
     buildTrackerRecords,
     candidateProgramIds,
+    codeKey,
     computeColumnCount,
+    configuredColumns,
+    describeColumns,
     createLimiter,
     emptyIntegrityReport,
     expectedRecordCounts,
     fetchAllPages,
+    flagIdMismatches,
     flagRecords,
     forecastWorkbook,
     formatBytes,
-    keyColumnsFor,
+    fullWardCode,
+    howTheSheetsLink,
+    linkColumnsFor,
     linkParents,
     makePageGuard,
     mapWithConcurrency,
     mergeByFormKey,
     orderColumns,
     pascalizeStageName,
+    programsToExtract,
     placeSpeciesOtherAfterSpecies,
     resolveFacilityIds,
+    resolveReadableCodes,
+    sheetColumns,
     summariseFlags,
     toCellValue,
     uniqueLabels,
@@ -39,15 +47,19 @@ import type {
     ResolvedForm,
 } from "../extract-forms";
 import {
+    AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID,
+    AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID,
     PREVALENCE_CASE_REPORT_FORM_ID,
     PREVALENCE_FACILITY_LEVEL_FORM_ID,
     PREVALENCE_MORTALITY_FOLLOWUP_FORM,
     PREVALENCE_SURVEY_FORM_ID,
+    PREVALENCE_SURVEY_NAME_DATAELEMENT_ID,
 } from "../../data/entities/D2Survey";
 
 function form(overrides: Partial<ResolvedForm> & Pick<ResolvedForm, "key">): ResolvedForm {
     return {
         requestedName: overrides.key,
+        title: overrides.key,
         uid: `${overrides.key}-uid`,
         serverName: overrides.key,
         kind: "tracker",
@@ -65,7 +77,6 @@ function record(overrides: Partial<Record_> & Pick<Record_, "id">): Record_ {
         surveyId: "",
         facilityId: "",
         orgUnit: "OU1",
-        label: overrides.id,
         values: new Map(),
         meta: new Map(),
         flags: [],
@@ -96,6 +107,7 @@ function programMeta(
         stageById: new Map((stages ?? []).map(s => [s.id, s])),
         valueTypes: new Map(),
         optionNames: new Map(),
+        fieldNames: new Map(),
         ...rest,
     };
 }
@@ -124,6 +136,7 @@ function realGraphForms() {
         }),
         caseReport: form({
             key: "CaseReport",
+            title: "Case report",
             uid: PREVALENCE_CASE_REPORT_FORM_ID,
             defaultUid: PREVALENCE_CASE_REPORT_FORM_ID,
             parentKey: "Survey",
@@ -187,8 +200,8 @@ describe("linkParents", () => {
     });
 });
 
-describe("keyColumnsFor", () => {
-    it("gives a leaf form Survey_id, Facility_id and CaseReport_id", () => {
+describe("linkColumnsFor", () => {
+    it("gives a leaf form the survey, facility, ward and case report record IDs", () => {
         const { survey, facility, caseReport, followUp } = realGraphForms();
         const all: FormData[] = [survey, facility, caseReport, followUp].map(f => ({
             form: f,
@@ -197,14 +210,15 @@ describe("keyColumnsFor", () => {
         }));
         const { byKey } = indexOf(all);
 
-        expect(keyColumnsFor(followUp, byKey).map(c => c.header)).toEqual([
-            "Survey_id",
-            "Facility_id",
-            "CaseReport_id",
+        expect(linkColumnsFor(followUp, byKey).map(c => c.header)).toEqual([
+            "Survey record ID",
+            "Facility record ID",
+            "Ward record ID",
+            "Case report record ID",
         ]);
     });
 
-    it("gives Case report Survey_id and Facility_id but no parent column (its parent IS Survey)", () => {
+    it("gives Case report no parent column of its own (its parent IS Survey)", () => {
         const { survey, facility, caseReport } = realGraphForms();
         const all: FormData[] = [survey, facility, caseReport].map(f => ({
             form: f,
@@ -213,13 +227,14 @@ describe("keyColumnsFor", () => {
         }));
         const { byKey } = indexOf(all);
 
-        expect(keyColumnsFor(caseReport, byKey).map(c => c.header)).toEqual([
-            "Survey_id",
-            "Facility_id",
+        expect(linkColumnsFor(caseReport, byKey).map(c => c.header)).toEqual([
+            "Survey record ID",
+            "Facility record ID",
+            "Ward record ID",
         ]);
     });
 
-    it("gives Facility only Survey_id, and Survey none", () => {
+    it("gives Facility only Survey record ID, and Survey none", () => {
         const { survey, facility } = realGraphForms();
         const all: FormData[] = [survey, facility].map(f => ({
             form: f,
@@ -228,8 +243,8 @@ describe("keyColumnsFor", () => {
         }));
         const { byKey } = indexOf(all);
 
-        expect(keyColumnsFor(facility, byKey).map(c => c.header)).toEqual(["Survey_id"]);
-        expect(keyColumnsFor(survey, byKey)).toEqual([]);
+        expect(linkColumnsFor(facility, byKey).map(c => c.header)).toEqual(["Survey record ID"]);
+        expect(linkColumnsFor(survey, byKey)).toEqual([]);
     });
 });
 
@@ -372,7 +387,10 @@ describe("flagRecords", () => {
         await flagRecords(all, recordIndex, noLookup);
 
         expect(junk.flags).toEqual([
-            { flag: "TEST/INVALID", detail: 'Survey_id "TEST SURVEY ID" is not a survey in DHIS2' },
+            {
+                flag: "TEST/INVALID",
+                detail: 'Survey record ID "TEST SURVEY ID" is not a survey in DHIS2',
+            },
         ]);
         expect(flagsOf(blank)).toEqual(["TEST/INVALID"]);
     });
@@ -394,11 +412,11 @@ describe("flagRecords", () => {
         expect(childOfDeleted.flags).toEqual([
             {
                 flag: "PARENT DELETED",
-                detail: "CaseReport DeletedCR01 was deleted in DHIS2 (last changed 2025-09-29)",
+                detail: "Case report DeletedCR01 was deleted in DHIS2 (last changed 2025-09-29)",
             },
         ]);
         expect(childOfJunk.flags).toEqual([
-            { flag: "PARENT MISSING", detail: 'CaseReport "test" does not exist in DHIS2' },
+            { flag: "PARENT MISSING", detail: 'Case report "test" does not exist in DHIS2' },
         ]);
     });
 
@@ -449,7 +467,7 @@ describe("flagRecords", () => {
 
         // Its own Survey_id (S1) also disagrees with the junk parent's, which is a finding too.
         expect(flagsOf(childOfJunk)).toEqual(["SURVEY MISMATCH", "PARENT FLAGGED"]);
-        expect(childOfJunk.flags[1]!.detail).toBe("CaseReport C9 is flagged: TEST/INVALID");
+        expect(childOfJunk.flags[1]!.detail).toBe("Case report C9 is flagged: TEST/INVALID");
         expect(flagsOf(wardRow)).toEqual(["PARENT FLAGGED"]);
     });
 
@@ -469,59 +487,8 @@ describe("flagRecords", () => {
         await flagRecords(all, recordIndex, noLookup);
 
         expect(summariseFlags(all)).toEqual([
-            { sheet: "CaseReport", flag: "TEST/INVALID", count: 1 },
+            { sheet: "Case report", flag: "TEST/INVALID", count: 1 },
         ]);
-    });
-});
-
-describe("buildBreadcrumb", () => {
-    const { survey, caseReport, followUp } = realGraphForms();
-
-    const surveyRec = record({ id: "S1", label: "Kenya PPS 2024", surveyId: "S1" });
-    const caseRec = record({ id: "C1", label: "Patient 0187", parentId: "S1", surveyId: "S1" });
-    const followUpRec = record({ id: "U1", label: "D28", parentId: "C1", surveyId: "S1" });
-
-    const all: FormData[] = [
-        { form: survey, records: [surveyRec], columns: new Map() },
-        { form: caseReport, records: [caseRec], columns: new Map() },
-        { form: followUp, records: [followUpRec], columns: new Map() },
-    ];
-
-    it("walks the FK chain from the root down to the record", () => {
-        const { byKey, recordIndex } = indexOf(all);
-
-        expect(buildBreadcrumb(followUp, followUpRec, byKey, recordIndex)).toBe(
-            "Kenya PPS 2024 > Patient 0187 > D28"
-        );
-    });
-
-    it("returns just the record's own label for a root record", () => {
-        const { byKey, recordIndex } = indexOf(all);
-        expect(buildBreadcrumb(survey, surveyRec, byKey, recordIndex)).toBe("Kenya PPS 2024");
-    });
-
-    it("falls back to the raw id when the parent is missing", () => {
-        const orphan = record({ id: "U2", label: "D28-orphan", parentId: "MISSING" });
-        const { byKey, recordIndex } = indexOf(all);
-
-        expect(buildBreadcrumb(followUp, orphan, byKey, recordIndex)).toBe("MISSING > D28-orphan");
-    });
-
-    it("stops cleanly when a record has no parent id", () => {
-        const detached = record({ id: "U3", label: "D28-detached", parentId: "" });
-        const { byKey, recordIndex } = indexOf(all);
-
-        expect(buildBreadcrumb(followUp, detached, byKey, recordIndex)).toBe("D28-detached");
-    });
-
-    it("does not loop forever if the data contains a parent cycle", () => {
-        const a = record({ id: "A", label: "A", parentId: "B" });
-        const b = record({ id: "B", label: "B", parentId: "A" });
-        const selfRef = form({ key: "Loop", parentKey: "Loop" });
-        const loopData: FormData[] = [{ form: selfRef, records: [a, b], columns: new Map() }];
-        const { byKey, recordIndex } = indexOf(loopData);
-
-        expect(buildBreadcrumb(selfRef, a, byKey, recordIndex)).toContain("A");
     });
 });
 
@@ -612,11 +579,8 @@ describe("buildTrackerRecords", () => {
 
         expect(stageRecords).toHaveLength(2);
         expect(stageRecords[0]).toMatchObject({ stageId: "WARD" });
-        expect(stageRecords[0]!.record).toMatchObject({
-            id: "W1",
-            parentId: "F1",
-            label: "2024-01-01",
-        });
+        expect(stageRecords[0]!.record).toMatchObject({ id: "W1", parentId: "F1" });
+        expect(stageRecords[0]!.record.meta.get("occurred_at")).toBe("2024-01-01");
         expect(stageRecords[1]!.record).toMatchObject({ id: "W2", parentId: "F1" });
         expect(stageRecords[0]!.record.values.get("de2")).toBe("ICU");
         expect(stageRecords[1]!.record.values.get("de2")).toBe("ER");
@@ -701,8 +665,8 @@ describe("buildTrackerRecords", () => {
     });
 });
 
-describe("keyColumnsFor (repeatable-stage children)", () => {
-    it("does not duplicate Facility_id when a repeatable stage belongs to Facility itself", () => {
+describe("linkColumnsFor (repeatable-stage children)", () => {
+    it("does not duplicate Facility record ID when a repeatable stage belongs to Facility itself", () => {
         const facility = form({ key: "Facility" });
         const wardStage = form({
             key: "Facility_WardData",
@@ -715,13 +679,13 @@ describe("keyColumnsFor (repeatable-stage children)", () => {
         ];
         const { byKey } = indexOf(all);
 
-        const headers = keyColumnsFor(wardStage, byKey).map(c => c.header);
+        const headers = linkColumnsFor(wardStage, byKey).map(c => c.header);
 
-        expect(headers).toEqual(["Survey_id", "Facility_id"]);
-        expect(headers.filter(h => h === "Facility_id")).toHaveLength(1);
+        expect(headers).toEqual(["Survey record ID", "Facility record ID"]);
+        expect(headers.filter(h => h === "Facility record ID")).toHaveLength(1);
     });
 
-    it("gives a repeatable stage under Case report Survey_id, Facility_id and CaseReport_id", () => {
+    it("gives a repeatable stage under Case report all four record IDs", () => {
         const { survey, facility, caseReport } = realGraphForms();
         const stageForm = form({
             key: "CaseReport_Diagnosis",
@@ -735,11 +699,329 @@ describe("keyColumnsFor (repeatable-stage children)", () => {
         }));
         const { byKey } = indexOf(all);
 
-        expect(keyColumnsFor(stageForm, byKey).map(c => c.header)).toEqual([
-            "Survey_id",
-            "Facility_id",
-            "CaseReport_id",
+        expect(linkColumnsFor(stageForm, byKey).map(c => c.header)).toEqual([
+            "Survey record ID",
+            "Facility record ID",
+            "Ward record ID",
+            "Case report record ID",
         ]);
+    });
+});
+
+const CASE_FACILITY_CODE = "qgPNgq0Ws7k";
+const CASE_WARD_CODE = "KoKmhwZGJnW";
+const WARD_DATA_CODE = "yAA33dsnWmY";
+const PATIENT_CODE = AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID;
+
+/** Survey > Facility (+ its ward data) and Survey > CaseReport > FollowUp, plus ward statistics. */
+function codesGraph(
+    opts: {
+        caseValues?: [string, string][];
+        followUpPatient?: string;
+        /** The follow-up form's own patient ID field (qsDC1eNnbgE). */
+        followUpOwn?: string;
+        extraFacility?: Record_;
+        surveyId?: string;
+    } = {}
+) {
+    const { survey, facility, caseReport, followUp } = realGraphForms();
+    const wardForm = form({
+        key: "Facility__WardData",
+        kind: "trackerStage",
+        parentKey: "Facility",
+    });
+    const wardStats = form({ key: "WardLevelStats", kind: "dataSet" });
+    const surveyId = opts.surveyId ?? "S1";
+
+    const surveyRec = record({
+        id: "S1",
+        surveyId: "S1",
+        values: new Map([[PREVALENCE_SURVEY_NAME_DATAELEMENT_ID, "MALAWI AMR SURVEY "]]),
+    });
+    const facilityRec = record({
+        id: "F1",
+        surveyId: "S1",
+        orgUnit: "OU_A",
+        values: new Map([[AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID, "HF025 "]]),
+    });
+    const wardRec = record({
+        id: "W1",
+        surveyId: "S1",
+        orgUnit: "OU_A",
+        parentId: "F1",
+        values: new Map([[WARD_DATA_CODE, "HF025/W16 "]]),
+    });
+    const caseRec = record({
+        id: "C1",
+        surveyId,
+        orgUnit: "OU_A",
+        parentId: surveyId,
+        values: new Map(
+            opts.caseValues ?? [
+                [CASE_FACILITY_CODE, "HF025"],
+                [CASE_WARD_CODE, "HF025/W16"],
+                [PATIENT_CODE, "HF025/W16/011"],
+            ]
+        ),
+    });
+    const followUpRec = record({
+        id: "U1",
+        surveyId,
+        orgUnit: "OU_A",
+        parentId: "C1",
+        values: new Map([
+            [PATIENT_CODE, opts.followUpPatient ?? "HF025/W16/011 "],
+            ...(opts.followUpOwn ? [["qsDC1eNnbgE", opts.followUpOwn] as [string, string]] : []),
+        ]),
+    });
+    const statRec = record({ id: "V1", orgUnit: "OU_A", wardName: "W16" });
+
+    const all: FormData[] = [
+        { form: survey, records: [surveyRec], columns: new Map() },
+        {
+            form: facility,
+            records: [facilityRec, ...(opts.extraFacility ? [opts.extraFacility] : [])],
+            columns: new Map(),
+        },
+        { form: wardForm, records: [wardRec], columns: new Map() },
+        { form: caseReport, records: [caseRec], columns: new Map() },
+        { form: followUp, records: [followUpRec], columns: new Map() },
+        { form: wardStats, records: [statRec], columns: new Map() },
+    ];
+    const { recordIndex } = indexOf(all);
+    const report = emptyIntegrityReport();
+    resolveFacilityIds(all, "Facility", report);
+    resolveReadableCodes(all, recordIndex, "Facility", report);
+    return {
+        all,
+        recordIndex,
+        report,
+        surveyRec,
+        facilityRec,
+        wardRec,
+        caseRec,
+        followUpRec,
+        statRec,
+    };
+}
+
+describe("resolveReadableCodes", () => {
+    it("fills the same four codes on every sheet, trimmed", () => {
+        const g = codesGraph();
+        const survey = "MALAWI AMR SURVEY";
+
+        expect(g.surveyRec.codes).toEqual({ survey, facility: "", ward: "", patient: "" });
+        expect(g.facilityRec.codes).toEqual({ survey, facility: "HF025", ward: "", patient: "" });
+        expect(g.wardRec.codes).toEqual({
+            survey,
+            facility: "HF025",
+            ward: "HF025/W16",
+            patient: "",
+        });
+        expect(g.caseRec.codes).toEqual({
+            survey,
+            facility: "HF025",
+            ward: "HF025/W16",
+            patient: "HF025/W16/011",
+        });
+        expect(g.followUpRec.codes).toEqual({
+            survey,
+            facility: "HF025",
+            ward: "HF025/W16",
+            patient: "HF025/W16/011",
+        });
+        expect(g.statRec.codes).toEqual({
+            survey: "",
+            facility: "HF025",
+            ward: "HF025/W16",
+            patient: "",
+        });
+    });
+
+    it("takes a child form's facility and ward from its case report but keeps its own patient code", () => {
+        const g = codesGraph({
+            caseValues: [
+                [CASE_FACILITY_CODE, "HF025"],
+                [CASE_WARD_CODE, "HF025/W16"],
+                [PATIENT_CODE, "HF025/W16/011"],
+            ],
+            followUpPatient: "HF025/W16/012",
+        });
+
+        expect(g.followUpRec.codes?.ward).toBe("HF025/W16");
+        expect(g.followUpRec.codes?.patient).toBe("HF025/W16/012");
+    });
+
+    it("leaves Survey_name blank for a Survey_id that is not a survey", () => {
+        const g = codesGraph({ surveyId: "test" });
+        expect(g.caseRec.codes?.survey).toBe("");
+    });
+
+    it("links a case report to its ward-data row, and its forms copy the link", () => {
+        const g = codesGraph();
+        expect(g.caseRec.wardId).toBe("W1");
+        expect(g.followUpRec.wardId).toBe("W1");
+        expect(g.report.unresolvedWard).toEqual([]);
+    });
+
+    it("reports a case report whose ward is not on its facility's list", () => {
+        const g = codesGraph({
+            caseValues: [
+                [CASE_FACILITY_CODE, "HF025"],
+                [CASE_WARD_CODE, "HF025/W99"],
+            ],
+        });
+        expect(g.caseRec.wardId).toBe("");
+        expect(g.report.unresolvedWard).toEqual([{ formKey: "CaseReport", count: 1 }]);
+    });
+
+    it("leaves ward statistics without codes where one org unit has two Hospital IDs", () => {
+        const g = codesGraph({
+            extraFacility: record({
+                id: "F2",
+                surveyId: "S2",
+                orgUnit: "OU_A",
+                values: new Map([[AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID, "HF099"]]),
+            }),
+        });
+        expect(g.statRec.codes).toEqual({ survey: "", facility: "", ward: "", patient: "" });
+        expect(g.report.ambiguousFacilityCodes).toEqual([
+            { orgUnit: "OU_A", codes: ["HF025", "HF099"] },
+        ]);
+    });
+});
+
+describe("flagIdMismatches", () => {
+    const details = (r: Record_) => r.flags.map(f => `${f.flag}: ${f.detail}`);
+
+    it("flags nothing when the codes agree (trailing spaces ignored)", () => {
+        const g = codesGraph();
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+        expect(g.all.flatMap(d => d.records).flatMap(r => r.flags)).toEqual([]);
+    });
+
+    it("flags a case report whose facility code differs from the Hospital ID", () => {
+        const g = codesGraph({
+            caseValues: [
+                [CASE_FACILITY_CODE, "HF026"],
+                [CASE_WARD_CODE, "HF025/W16"],
+                [PATIENT_CODE, "HF025/W16/011"],
+            ],
+        });
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+        expect(details(g.caseRec)).toEqual([
+            `ID MISMATCH: Unique facility ID "HF026" differs from its facility's on the Facility form ("HF025")`,
+            `ID MISMATCH: Unique ward ID "HF025/W16" does not start with its Unique facility ID "HF026/"`,
+        ]);
+    });
+
+    it("flags a ward not on the facility's list and a patient code outside its ward", () => {
+        const g = codesGraph({
+            caseValues: [
+                [CASE_FACILITY_CODE, "HF025"],
+                [CASE_WARD_CODE, "HF025/W99"],
+                [PATIENT_CODE, "HF025/W16/011"],
+            ],
+        });
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+        expect(details(g.caseRec)).toEqual([
+            `ID MISMATCH: Unique ward ID "HF025/W99" is not among its facility's wards on the Facility form`,
+            `ID MISMATCH: Unique survey patient ID "HF025/W16/011" does not start with its Unique ward ID "HF025/W99/"`,
+        ]);
+        // The DHIS2 link is fine, so the case report's forms are not marked PARENT FLAGGED.
+        expect(g.followUpRec.flags).toEqual([]);
+    });
+
+    it("ignores case, spaces and leading zeros, and completes a bare ward", () => {
+        const g = codesGraph({
+            caseValues: [
+                [CASE_FACILITY_CODE, "hf 25"],
+                [CASE_WARD_CODE, "W16"],
+                [PATIENT_CODE, "HF025/ W16/11"],
+            ],
+            followUpPatient: "hf025/w16/011",
+        });
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+
+        expect(g.caseRec.codes?.ward).toBe("hf 25/W16");
+        expect(g.caseRec.wardId).toBe("W1");
+        expect(g.all.flatMap(d => d.records).flatMap(r => r.flags)).toEqual([]);
+    });
+
+    it("flags a child form whose patient code differs from its case report's", () => {
+        const g = codesGraph({ followUpPatient: "HF025/W16/012" });
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+        expect(details(g.followUpRec)).toEqual([
+            `ID MISMATCH: Unique survey patient ID "HF025/W16/012" differs from its case report's "HF025/W16/011"`,
+        ]);
+    });
+
+    it("accepts the form's own patient ID field as the patient ID, with or without /C3", () => {
+        for (const own of ["HF025/W16/011", "hf025/w16/011/c3"]) {
+            const g = codesGraph({ followUpOwn: own });
+            flagIdMismatches(g.all, g.recordIndex, "Facility");
+            expect(g.followUpRec.flags).toEqual([]);
+        }
+    });
+
+    it("flags the form's own patient ID field when it is another patient's", () => {
+        const g = codesGraph({ followUpOwn: "HF025/W16/012/C3" });
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+        expect(details(g.followUpRec)).toEqual([
+            `ID MISMATCH: This form's own patient ID field "HF025/W16/012/C3" is neither its Unique survey patient ID "HF025/W16/011" nor that + /C3`,
+        ]);
+    });
+
+    it("does not flag blanks", () => {
+        const g = codesGraph({ caseValues: [[CASE_WARD_CODE, "HF025/W16"]], followUpPatient: "" });
+        flagIdMismatches(g.all, g.recordIndex, "Facility");
+        expect(g.all.flatMap(d => d.records).flatMap(r => r.flags)).toEqual([]);
+    });
+});
+
+describe("codeKey and fullWardCode", () => {
+    it("compares codes regardless of case, spaces and leading zeros", () => {
+        expect(codeKey("hf025/ w1")).toBe(codeKey("HF025/W01"));
+        expect(codeKey("HF025/")).toBe(codeKey("HF025"));
+        // Cyrillic "С" (U+0421) looks exactly like Latin "C".
+        expect(codeKey("HF025/W16/011/С3")).toBe(codeKey("HF025/W16/011/C3"));
+        expect(codeKey("HF025/W10")).not.toBe(codeKey("HF025/W1"));
+        expect(codeKey("HF025//W16")).not.toBe(codeKey("HF025/W16"));
+    });
+
+    it("completes only a ward typed without its facility", () => {
+        expect(fullWardCode("W16", "HF025")).toBe("HF025/W16");
+        expect(fullWardCode("HF025/W16", "HF025")).toBe("HF025/W16");
+        // Missing slash or the facility alone: left as typed, so the check flags it.
+        expect(fullWardCode("HF025W16", "HF025")).toBe("HF025W16");
+        expect(fullWardCode("HF025", "HF025")).toBe("HF025");
+        expect(fullWardCode("W16", "")).toBe("W16");
+        expect(fullWardCode("", "HF025")).toBe("");
+    });
+});
+
+describe("howTheSheetsLink", () => {
+    it("describes only the sheets present", () => {
+        const g = codesGraph();
+        const topics = howTheSheetsLink(g.all).map(([topic]) => topic);
+
+        expect(topics).toEqual([
+            "Colours",
+            "Complete",
+            "Two kinds of ID",
+            "The IDs nest",
+            "Survey",
+            "Facility",
+            "Facility__WardData",
+            "Case report",
+            "FollowUpD28",
+            "WardLevelStats",
+            "Data check",
+            "In Excel",
+            "Power BI / SQL",
+        ]);
+        const onlySurvey = howTheSheetsLink([g.all[0]!]).map(([topic]) => topic);
+        expect(onlySurvey).not.toContain("Case report");
     });
 });
 
@@ -1541,27 +1823,174 @@ describe("toCellValue: precision", () => {
     });
 });
 
-describe("computeColumnCount", () => {
-    it("matches the header shape writeFormSheet actually produces for a leaf form", () => {
-        const { survey, facility, caseReport, followUp } = realGraphForms();
-        const all: FormData[] = [survey, facility, caseReport, followUp].map(f => ({
-            form: f,
-            records: [],
-            columns: new Map(),
-        }));
-        const byKey = new Map(all.map(d => [d.form.key, d]));
+/** A follow-up program: a patient-ID attribute, its two link fields, a question, two stages. */
+function followUpMeta(): ProgramMeta {
+    return programMeta({
+        attributes: new Map([
+            [PATIENT_CODE, "Unique survey patient ID"],
+            ["srvLink", "Survey ID"],
+            ["parLink", "Patient ID"],
+            ["qsDC1eNnbgE", "Unique survey patient ID (this form's own field: ___ or ___/C3)"],
+        ]),
+        attributeOrder: new Map([
+            [PATIENT_CODE, 0],
+            ["srvLink", 1],
+            ["parLink", 2],
+            ["qsDC1eNnbgE", 3],
+        ]),
+        fieldNames: new Map([
+            [PATIENT_CODE, "Unique survey patient ID"],
+            ["qsDC1eNnbgE", "Unique survey patient ID-Fup"],
+            ["de1", "Outcome at D28"],
+        ]),
+        stages: [
+            stage({
+                id: "st1",
+                name: "Follow-up",
+                dataElementLabels: new Map([["de1", "Outcome"]]),
+                dataElementOrder: new Map([["de1", 0]]),
+            }),
+            stage({
+                id: "st2",
+                name: "Visits",
+                repeatable: true,
+                dataElementLabels: new Map([["de2", "Visit date"]]),
+            }),
+        ],
+    });
+}
 
-        // FollowUpD28: 3 key cols (Survey_id, Facility_id, CaseReport_id) + 6 fixed (flag,
-        // flag_detail, path, record_id, org_unit_id, org_unit_name) + metaKeyCount + valueColumnCount.
-        const columns = computeColumnCount(followUp, byKey, 4, 6);
-        expect(columns).toBe(3 + 6 + 4 + 6);
+function followUpGraph() {
+    const { survey, facility, caseReport, followUp } = realGraphForms();
+    const linked = { ...followUp, surveyLinkField: "srvLink", parentLinkField: "parLink" };
+    const all: FormData[] = [survey, facility, caseReport, linked].map(f => ({
+        form: f,
+        records: [],
+        columns: new Map(),
+    }));
+    return { followUp: linked, byKey: new Map(all.map(d => [d.form.key, d])) };
+}
+
+describe("sheetColumns", () => {
+    it("orders a patient form: identification, data check, questions, DHIS2 linking and system", () => {
+        const { followUp, byKey } = followUpGraph();
+        const meta = followUpMeta();
+        const columns = configuredColumns(meta, "tracker");
+        const sheet = sheetColumns(
+            { form: followUp, records: [], columns, columnInfo: describeColumns(columns, meta) },
+            byKey
+        );
+
+        expect(sheet.map(c => [c.group, c.header])).toEqual([
+            ["identification", "Survey name"],
+            ["identification", "Facility name"],
+            ["identification", "Unique facility ID (from case report)"],
+            ["identification", "Unique ward ID (from case report)"],
+            ["identification", "Unique survey patient ID"],
+            ["check", "Data check"],
+            ["check", "Data check details"],
+            // The patient ID and the two link fields are not repeated as questions.
+            ["form", "Unique survey patient ID (this form's own field: ___ or ___/C3)"],
+            ["form", "Follow-up: Outcome"],
+            ["system", "Record ID"],
+            ["system", "Survey record ID"],
+            ["system", "Facility record ID"],
+            ["system", "Ward record ID"],
+            ["system", "Case report record ID"],
+            ["system", "DHIS2 org unit ID"],
+            ["system", "Date entered"],
+            ["system", "Last changed"],
+            ["system", "Enrolled on"],
+            ["system", "Status"],
+            ["system", "Form version"],
+        ]);
+        expect(sheet.find(c => c.header === "Follow-up: Outcome")?.about).toBe(
+            "Follow-up. DHIS2 field: Outcome at D28 (de1)."
+        );
     });
 
-    it("gives Survey (root, no ancestors) just fixed + meta + value columns", () => {
+    it("gives the Survey sheet its name and country, not the SurveyName field again", () => {
         const { survey } = realGraphForms();
         const byKey = new Map([[survey.key, { form: survey, records: [], columns: new Map() }]]);
+        const columns = new Map([
+            [PREVALENCE_SURVEY_NAME_DATAELEMENT_ID, "SurveyName"],
+            ["start", "SurveyStartDate"],
+        ]);
+        const headers = sheetColumns({ form: survey, records: [], columns }, byKey).map(
+            c => c.header
+        );
 
-        expect(computeColumnCount(survey, byKey, 4, 269)).toBe(0 + 6 + 4 + 269);
+        expect(headers.slice(0, 2)).toEqual(["Survey name", "Country"]);
+        expect(headers).not.toContain("SurveyName");
+        expect(headers).toContain("SurveyStartDate");
+    });
+
+    it("tells apart a form's own copy of an identification field", () => {
+        const { followUp, byKey } = followUpGraph();
+        const columns = new Map([
+            ["other", "Unique survey patient ID"],
+            ["facOwn", "Unique facility ID"],
+        ]);
+        const columnInfo = new Map([
+            ["other", { section: "", dhis2Name: "Unique survey patient ID-DF", id: "other" }],
+        ]);
+        const headers = sheetColumns(
+            { form: followUp, records: [], columns, columnInfo },
+            byKey
+        ).map(c => c.header);
+
+        expect(headers).toContain("Unique survey patient ID (this form's own field)");
+        expect(headers.filter(h => h === "Unique survey patient ID")).toHaveLength(1);
+        // The form's own facility field, next to the one copied from the case report.
+        expect(headers).toContain("Unique facility ID (this form's own field)");
+        expect(headers).toContain("Unique facility ID (from case report)");
+    });
+});
+
+describe("computeColumnCount", () => {
+    it("counts every configured field, answered or not, as the written sheet will", () => {
+        const { followUp, byKey } = followUpGraph();
+        const meta = followUpMeta();
+
+        // 5 identification + 2 data check + 2 questions + 11 DHIS2 linking and system.
+        expect(computeColumnCount(followUp, byKey, meta)).toBe(20);
+        expect(computeColumnCount(followUp, byKey, meta)).toBe(
+            sheetColumns(
+                { form: followUp, records: [], columns: configuredColumns(meta, "tracker") },
+                byKey
+            ).length
+        );
+    });
+});
+
+describe("programsToExtract", () => {
+    const defaultCase = form({ key: "CaseReport", uid: "default", defaultUid: "default" });
+    const customCase = form({ key: "CaseReport", uid: "custom", defaultUid: "default" });
+
+    it("skips a proven-empty program when another program of the form has data", () => {
+        const kept = programsToExtract(
+            [defaultCase, customCase],
+            new Map([
+                ["default", 0],
+                ["custom", 12],
+            ])
+        );
+        expect(kept).toEqual([customCase]);
+    });
+
+    it("keeps the default program of a form with no data anywhere, so it gets its sheet", () => {
+        const kept = programsToExtract(
+            [defaultCase, customCase],
+            new Map([
+                ["default", 0],
+                ["custom", 0],
+            ])
+        );
+        expect(kept).toEqual([defaultCase]);
+    });
+
+    it("keeps programs whose count is unknown", () => {
+        expect(programsToExtract([customCase], new Map())).toEqual([customCase]);
     });
 });
 
@@ -1614,10 +2043,9 @@ describe("forecastWorkbook", () => {
         expect(forecastWorkbook(discoveries).warnings).toEqual([]);
     });
 
-    it("excludes a form proven to have 0 records — extraction skips it, so no sheet is produced", () => {
-        // Live-verified case: DischargeEconomic had total=0, so extract() never calls
-        // fetchTracker for it, so its (also-0-row) repeatable stage never materializes
-        // either. The forecast must match, not merely list everything discovery saw.
+    it("still gives a form proven to have 0 records its (empty) sheets, as extraction does", () => {
+        // DischargeEconomic had total=0: its default program is still extracted (one empty
+        // page), so it and its repeatable stage get empty sheets with every column.
         const discoveries: FormDiscovery[] = [
             discoveryFor({
                 form: form({ key: "DischargeEconomic" }),
@@ -1638,10 +2066,14 @@ describe("forecastWorkbook", () => {
 
         const forecast = forecastWorkbook(discoveries);
 
-        expect(forecast.sheets.map(s => s.sheetKey)).toEqual(["Facility"]);
+        expect(forecast.sheets.map(s => [s.sheetKey, s.rows])).toEqual([
+            ["DischargeEconomic", 0],
+            ["DischargeEconomic__EconomicEvaluation", 0],
+            ["Facility", 40],
+        ]);
     });
 
-    it("excludes a repeatable stage with 0 rows even when its owning form has data", () => {
+    it("keeps a repeatable stage with 0 rows: every stage gets its sheet", () => {
         const discoveries: FormDiscovery[] = [
             discoveryFor({
                 form: form({ key: "Facility" }),
@@ -1668,7 +2100,11 @@ describe("forecastWorkbook", () => {
 
         const forecast = forecastWorkbook(discoveries);
 
-        expect(forecast.sheets.map(s => s.sheetKey)).toEqual(["Facility", "Facility__WardData"]);
+        expect(forecast.sheets.map(s => s.sheetKey)).toEqual([
+            "Facility",
+            "Facility__EmptyStage",
+            "Facility__WardData",
+        ]);
     });
 
     it("leaves cells undefined (not zero) when rows or columns aren't known, rather than under-forecasting", () => {

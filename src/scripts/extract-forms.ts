@@ -50,6 +50,7 @@ import {
     AMR_SURVEYS_PREVALENCE_TEA_SURVEY_ID_PIS,
     AMR_SURVEYS_PREVALENCE_TEA_SURVEY_ID_SRL,
     AMR_SURVEYS_PREVALENCE_TEA_SURVEY_ID_SSTF,
+    AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID,
     AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID,
     SURVEY_ID_FACILITY_LEVEL_DATAELEMENT_ID,
     PREVALENCE_CASE_REPORT_FORM_ID,
@@ -76,8 +77,10 @@ import {
 type FormKind = "tracker" | "event" | "dataSet" | "trackerStage";
 
 type FormSpec = {
-    /** Short stable key; used as the Excel sheet name and in the FK columns. */
+    /** Short stable key: --forms takes it, and it identifies the sheet internally. */
     key: string;
+    /** What readers see: the sheet name, and "<title> record ID" headers. */
+    title: string;
     /** Name as it appears on the DHIS2 server. Display only; resolution is by UID. */
     requestedName: string;
     /**
@@ -92,9 +95,15 @@ type FormSpec = {
 };
 
 const FORMS: FormSpec[] = [
-    { key: "Survey", requestedName: "Survey form", defaultUid: PREVALENCE_SURVEY_FORM_ID },
+    {
+        key: "Survey",
+        title: "Survey",
+        requestedName: "Survey form",
+        defaultUid: PREVALENCE_SURVEY_FORM_ID,
+    },
     {
         key: "Facility",
+        title: "Facility",
         requestedName: "Facility-level form",
         defaultUid: PREVALENCE_FACILITY_LEVEL_FORM_ID,
         parentKey: "Survey",
@@ -102,54 +111,63 @@ const FORMS: FormSpec[] = [
     {
         // Parent is Survey, NOT Facility — see the note on PARENT_BY_DEFAULT_UID.
         key: "CaseReport",
+        title: "Case report",
         requestedName: "Case report form - custom v1",
         defaultUid: PREVALENCE_CASE_REPORT_FORM_ID,
         parentKey: "Survey",
     },
     {
         key: "SampleShipment",
+        title: "Sample shipment",
         requestedName: "Sample shipment and tracking form - custom v1",
         defaultUid: PREVALENCE_SAMPLE_SHIP_TRACK_FORM_ID,
         parentKey: "CaseReport",
     },
     {
         key: "CentralRefLab",
+        title: "Central ref lab",
         requestedName: "Central reference laboratory ID/AST results form",
         defaultUid: PREVALENCE_CENTRAL_REF_LAB_FORM_ID,
         parentKey: "CaseReport",
     },
     {
         key: "PathogenIsolates",
+        title: "Pathogen isolates",
         requestedName: "Pathogen Isolates storage and tracking log",
         defaultUid: PREVALENCE_PATHOGEN_ISO_STORE_TRACK_ID,
         parentKey: "CaseReport",
     },
     {
         key: "Supranational",
+        title: "Supranational ref lab",
         requestedName: "Supranational Reference Laboratory ID/AST results form",
         defaultUid: PREVALENCE_SUPRANATIONAL_REF_LAB_ID,
         parentKey: "CaseReport",
     },
     {
         key: "FollowUpD28",
+        title: "Follow-up D28",
         requestedName: "Follow-up form D28 - custom v1",
         defaultUid: PREVALENCE_MORTALITY_FOLLOWUP_FORM,
         parentKey: "CaseReport",
     },
     {
         key: "DischargeClinical",
+        title: "Discharge clinical",
         requestedName: "Discharge form - Clinical Evaluation",
         defaultUid: PREVALENCE_MORTALITY_DISCHARGE_CLINICAL_FORM,
         parentKey: "CaseReport",
     },
     {
         key: "DischargeEconomic",
+        title: "Discharge economic",
         requestedName: "Discharge form - Economical Evaluation",
         defaultUid: PREVALENCE_MORTALITY_DISCHARGE_ECONOMIC_FORM,
         parentKey: "CaseReport",
     },
     {
         key: "CohortEnrolment",
+        title: "Cohort enrolment",
         requestedName: "Cohort 3 enrolment form - custom v1",
         defaultUid: PREVALENCE_MORTALITY_COHORT_ENORL_FORM,
         parentKey: "CaseReport",
@@ -157,12 +175,14 @@ const FORMS: FormSpec[] = [
     {
         // Ward x specialty. Its successor below holds ward-level values; both are live.
         key: "WardSummaryStats",
+        title: "Ward summary statistics",
         requestedName: "Ward Summary Statistics",
         defaultUid: WARD_SUMMARY_STATISTICS_FORM_ID,
         kind: "dataSet",
     },
     {
         key: "WardLevelStats",
+        title: "Ward level statistics",
         requestedName: "Ward Statistics for Ward",
         defaultUid: WARD_STATISTICS_WARD_LEVEL_FORM_ID,
         kind: "dataSet",
@@ -196,12 +216,50 @@ export type Record_ = {
     /** Facility record id, derived from (surveyId, orgUnit) — not a stored FK. */
     facilityId: string;
     orgUnit: string;
-    label: string;
     values: Map<string, string>;
     meta: Map<string, string>;
     /** Data-quality flags, shown first on the row so epidemiologists see them (see flagRecords). */
     flags: RecordFlag[];
+    /** The readable codes shown first on every sheet (see resolveReadableCodes). */
+    codes?: ReadableCodes;
+    /** Ward-data record of the patient's ward, derived like facilityId (see resolveReadableCodes). */
+    wardId?: string;
+    /** Ward statistics rows only: the bare ward name ("W16") from the dataSet's ward category. */
+    wardName?: string;
 };
+
+/**
+ * The codes survey teams type, as opposed to DHIS2 record ids. They nest: patient
+ * HF025/W16/011 is in ward HF025/W16, in facility HF025 (verified on prod, Oct 2026).
+ * Trimmed; "" where a sheet has no such code.
+ */
+export type ReadableCodes = { survey: string; facility: string; ward: string; patient: string };
+
+const NO_CODES: ReadableCodes = { survey: "", facility: "", ward: "", patient: "" };
+
+// Where the readable codes are typed. Only this script reads them, so they are kept here
+// rather than in D2Survey.ts.
+const CASE_REPORT_FACILITY_CODE_TEA = "qgPNgq0Ws7k"; // "Unique facility ID"
+const CASE_REPORT_WARD_CODE_TEA = "KoKmhwZGJnW"; // "Unique ward/department ID"
+const FACILITY_WARD_CODE_DATAELEMENT_ID = "yAA33dsnWmY"; // Facility form, "Ward data" stage
+const WARD_ID_CATEGORY_ID = "ROJT9Xpehsv"; // "Ward ID", the ward category of both ward dataSets
+
+/**
+ * The follow-up, discharge and cohort forms carry a second patient ID field of their own,
+ * next to the shared "Unique survey patient ID". It holds the patient ID or, for cohort 3,
+ * the patient ID + "/C3" (Malawi on preprod, Oct 2026: about 330 and 250 follow-ups). The
+ * cohort form labels it "Unique survey patient ID (___/C3)"; the follow-up and discharge
+ * forms label it exactly like the shared field, so the extract renames those two.
+ */
+const OWN_PATIENT_ID_TEAS = new Set(["qsDC1eNnbgE", "Cw0y6iIZ4nb", "GuAjeIwxA6f"]);
+const UNLABELLED_OWN_PATIENT_ID_TEAS = new Set(["qsDC1eNnbgE", "Cw0y6iIZ4nb"]);
+const OWN_PATIENT_ID_LABEL = "Unique survey patient ID (this form's own field: ___ or ___/C3)";
+
+/** A field's form label, except where the form's label hides what the field is. */
+function fieldLabel(field: { id: string; name: string; formName?: string }): string {
+    if (UNLABELLED_OWN_PATIENT_ID_TEAS.has(field.id)) return OWN_PATIENT_ID_LABEL;
+    return field.formName || field.name;
+}
 
 export type FlagKind =
     | "TEST/INVALID"
@@ -209,21 +267,26 @@ export type FlagKind =
     | "PARENT MISSING"
     | "OUTSIDE EXTRACT"
     | "SURVEY MISMATCH"
-    | "PARENT FLAGGED";
+    | "PARENT FLAGGED"
+    | "ID MISMATCH";
 
 export type RecordFlag = { flag: FlagKind; detail: string };
 
 /** What each flag means, for the _index legend. */
 export const FLAG_MEANINGS: Record<FlagKind, string> = {
     "TEST/INVALID":
-        "The record's Survey_id is missing or is not a survey in DHIS2: almost always test data.",
+        "The record's Survey record ID is missing or is not a survey in DHIS2: almost always test data.",
     "PARENT DELETED":
         "The record it belongs to (its case report or survey) was deleted in DHIS2; this record was not.",
     "PARENT MISSING": "The record it belongs to does not exist in DHIS2 (or no link was recorded).",
     "OUTSIDE EXTRACT":
         "The record it belongs to exists in DHIS2 but under another org unit, outside this extract.",
-    "SURVEY MISMATCH": "Its own Survey_id differs from the Survey_id of the record it belongs to.",
+    "SURVEY MISMATCH": "Its own Survey record ID differs from that of the record it belongs to.",
     "PARENT FLAGGED": "The record it belongs to is itself flagged; see that record's flag.",
+    "ID MISMATCH":
+        "The facility, ward or patient codes typed on it disagree with each other or with the " +
+        "record it belongs to, ignoring case, spaces, leading zeros, a trailing slash and Cyrillic look-alike letters (see Data check details). The " +
+        "DHIS2 links (*_id columns) are not affected.",
 };
 
 export type FormData = {
@@ -233,9 +296,25 @@ export type FormData = {
     columns: Map<string, string>;
     /** Value column UID -> DHIS2 valueType; absent means the column is written as text. */
     valueTypes?: Map<string, string>;
+    /** Value column UID -> where it comes from, for header notes and the Column guide. */
+    columnInfo?: Map<string, ColumnInfo>;
+};
+
+/** Where a form column comes from. */
+export type ColumnInfo = {
+    /** The form section (or stage) it sits in. */
+    section: string;
+    /** The field's DHIS2 name and id, e.g. "Unique survey patient ID-Fup" (qsDC1eNnbgE). */
+    dhis2Name: string;
+    id: string;
 };
 
 const EXCEL_MAX_ROWS = 1_048_576;
+
+// The workbook's own sheets, before the form sheets. Form sheets can never take these names.
+const READ_ME_SHEET = "Read me";
+const COLUMN_GUIDE_SHEET = "Column guide";
+const JOINS_SHEET = "Joins (technical)";
 
 /** Matches glass-dev's bulkDownloadAMUFiles.ts, which this server tolerates well. */
 const FETCH_CONCURRENCY = 6;
@@ -533,6 +612,8 @@ export type ProgramMeta = {
     valueTypes: Map<string, string>;
     /** dataElement/attribute id -> (option code -> option name), for option-set fields. */
     optionNames: Map<string, Map<string, string>>;
+    /** dataElement/attribute id -> its DHIS2 name, which, unlike a form label, is unique. */
+    fieldNames: Map<string, string>;
 };
 
 /** The option's name where the field is option-backed, else the stored value unchanged. */
@@ -662,12 +743,12 @@ async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<
     const attributes = new Map<string, string>();
     const attributeOrder = new Map<string, number>();
     for (const tea of program.trackedEntityAttributes ?? []) {
-        attributes.set(tea.id, tea.formName || tea.name);
+        attributes.set(tea.id, fieldLabel(tea));
     }
     for (const p of program.programs ?? []) {
         (p.programTrackedEntityAttributes ?? []).forEach((ptea, index) => {
             const tea = ptea.trackedEntityAttribute;
-            if (!attributes.has(tea.id)) attributes.set(tea.id, tea.formName || tea.name);
+            if (!attributes.has(tea.id)) attributes.set(tea.id, fieldLabel(tea));
             attributeOrder.set(tea.id, ptea.sortOrder ?? index);
         });
     }
@@ -715,16 +796,22 @@ async function fetchProgramMetaUncached(api: D2Api, programId: string): Promise<
 
     const valueTypes = new Map<string, string>();
     const optionNames = new Map<string, Map<string, string>>();
+    const fieldNames = new Map<string, string>();
+    for (const stage of stages) {
+        for (const { dataElement } of stage.programStageDataElements ?? [])
+            fieldNames.set(dataElement.id, dataElement.name);
+    }
     for (const field of [
         ...(program.dataElements ?? []),
         ...(program.trackedEntityAttributes ?? []),
     ]) {
+        fieldNames.set(field.id, field.name);
         if (field.valueType) valueTypes.set(field.id, field.valueType);
         const names = field.optionSet && namesByOptionSet.get(field.optionSet.id);
         if (names) optionNames.set(field.id, names);
     }
 
-    return { attributes, attributeOrder, stageById, valueTypes, optionNames };
+    return { attributes, attributeOrder, stageById, valueTypes, optionNames, fieldNames };
 }
 
 const SPECIES_LABEL = "Specify the species";
@@ -816,20 +903,37 @@ export function orderColumns(
 }
 
 /**
- * Makes every header unique, keeping order. A repeated block reuses the same field names — a
- * bare "Specify the antibiotic" appearing 24 times tells the reader nothing — and two
- * programs merged into one sheet can each bring a field with the same label. Where a label
- * still repeats, occurrences are numbered in column order. Applied once, at write time, so it
- * sees the final (merged) column set.
+ * Makes every header unique, keeping order. Two different fields can carry the same form
+ * label (two programs merged into one sheet, or one form reusing a label), and a form label
+ * can equal one of the extract's own headers (`reserved`). Such a header gets the field's
+ * DHIS2 name, which is unique, in brackets: "Unique facility ID [Unique facility ID-Fup]".
+ * Whatever still repeats is numbered in column order. Applied once, at write time, so it sees
+ * the final (merged) column set.
  */
-export function uniqueLabels(columns: Map<string, string>): Map<string, string> {
-    const labelCounts = new Map<string, number>();
-    for (const label of columns.values()) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+export function uniqueLabels(
+    columns: Map<string, string>,
+    dhis2Names: Map<string, string> = new Map(),
+    reserved: ReadonlySet<string> = new Set()
+): Map<string, string> {
+    const count = (labels: Iterable<string>) => {
+        const counts = new Map<string, number>();
+        for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
+        return counts;
+    };
 
+    const firstCounts = count(columns.values());
+    const named = new Map<string, string>();
+    for (const [key, label] of columns) {
+        const clash = (firstCounts.get(label) ?? 0) > 1 || reserved.has(label);
+        const name = dhis2Names.get(key);
+        named.set(key, clash && name && name !== label ? `${label} [${name}]` : label);
+    }
+
+    const counts = count(named.values());
     const seen = new Map<string, number>();
     const result = new Map<string, string>();
-    for (const [key, label] of columns) {
-        if ((labelCounts.get(label) ?? 0) === 1) {
+    for (const [key, label] of named) {
+        if ((counts.get(label) ?? 0) === 1 && !reserved.has(label)) {
             result.set(key, label);
             continue;
         }
@@ -838,6 +942,60 @@ export function uniqueLabels(columns: Map<string, string>): Map<string, string> 
         result.set(key, `${label} #${occurrence}`);
     }
     return result;
+}
+
+/** The section shown for a tracker program's own attributes (its registration fields). */
+const REGISTRATION_SECTION = "Registration";
+
+/**
+ * Every field configured on the form, keyed and labelled exactly as the record builders key
+ * and label the values they meet, so a question nobody answered still gets its column. With
+ * `stage`: that repeatable stage's own sheet. Otherwise the main sheet: a tracker program's
+ * attributes and single-entry stages, or every stage of an event program.
+ */
+export function configuredColumns(
+    meta: ProgramMeta,
+    kind: FormKind,
+    stage?: ProgramStageMeta
+): Map<string, string> {
+    const columns = new Map<string, string>();
+    if (stage) return new Map(stage.dataElementLabels);
+
+    const stages = [...meta.stageById.values()];
+    if (kind === "event") {
+        for (const s of stages)
+            for (const [id, label] of s.dataElementLabels) columns.set(id, label);
+        return columns;
+    }
+    for (const id of meta.attributeOrder.keys()) columns.set(id, meta.attributes.get(id) ?? id);
+    for (const s of stages.filter(s => !s.repeatable)) {
+        for (const [id, label] of s.dataElementLabels) {
+            columns.set(`${STAGE_COLUMN_PREFIX}${id}`, stageColumnLabel(s, id, label));
+        }
+    }
+    return columns;
+}
+
+/** Section and DHIS2 name of each column (see ColumnInfo); "" where the form no longer has it. */
+export function describeColumns(
+    columns: Map<string, string>,
+    meta: ProgramMeta,
+    stage?: ProgramStageMeta
+): Map<string, ColumnInfo> {
+    const info = new Map<string, ColumnInfo>();
+    for (const key of columns.keys()) {
+        const isStageValue = key.startsWith(STAGE_COLUMN_PREFIX);
+        const id = isStageValue ? key.slice(STAGE_COLUMN_PREFIX.length) : key;
+        const owner = stage ?? [...meta.stageById.values()].find(s => s.dataElementLabels.has(id));
+        const isAttribute = !stage && !isStageValue && meta.attributeOrder.has(id);
+        const section = isAttribute
+            ? REGISTRATION_SECTION
+            : owner?.dataElementLabels.has(id)
+            ? owner.dataElementSection.get(id) ?? owner.name
+            : "";
+        info.set(key, { section, dhis2Name: meta.fieldNames.get(id) ?? "", id });
+    }
+    return info;
 }
 
 // --- Extraction ---------------------------------------------------------------
@@ -854,23 +1012,6 @@ type FetchOpts = {
     /** Org units to read dataSets under when no --org-unit/--country scope is given. */
     dataSetRoots?: string[];
 };
-
-/**
- * Meta-column-key lists, named once so the discovery/forecast column-count math (which
- * predicts a sheet's shape before any records are fetched) can never drift from what the
- * real fetch functions below actually write — both reference the same `.length`.
- */
-const TRACKER_MAIN_META_KEYS = [
-    "created_at",
-    "updated_at",
-    "enrolled_at",
-    "status",
-    "program",
-] as const;
-const TRACKER_STAGE_CHILD_META_KEYS = ["occurred_at", "status", "program"] as const;
-const EVENT_META_KEYS = ["occurred_at", "created_at", "updated_at", "status", "program"] as const;
-/** flag, flag_detail, path, record_id, org_unit_id, org_unit_name — on every sheet regardless of kind. */
-const FIXED_NON_META_COLUMNS = 6;
 
 /**
  * The ResolvedForm shape a repeatable stage's child sheet gets. Shared by fetchTracker
@@ -891,6 +1032,7 @@ export function buildStageChildForm(
         serverName: stage.name,
         kind: "trackerStage",
         defaultUid: `${owner.defaultUid}#${stage.id}`,
+        title: `${owner.title} - ${stage.name}`,
         isCustom: owner.isCustom,
         // Not a stored attribute: parentId is the owning TEI's own id, so there is no
         // attribute UID to record here.
@@ -1062,7 +1204,6 @@ export function buildTrackerRecords(
         surveyId,
         facilityId: "", // derived later by resolveFacilityIds()
         orgUnit: tei.orgUnit ?? "",
-        label: values.get(AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID) ?? tei.trackedEntity,
         values,
         meta: new Map<string, string>([
             ["created_at", tei.createdAt ?? ""],
@@ -1110,7 +1251,6 @@ export function buildTrackerRecords(
                 surveyId,
                 facilityId: "",
                 orgUnit: tei.orgUnit ?? "",
-                label: event.occurredAt ?? event.event,
                 values: childValues,
                 meta: new Map([
                     ["occurred_at", event.occurredAt ?? ""],
@@ -1393,41 +1533,57 @@ async function fetchTracker(
     }
     await labelOffFormFields(api, session, form.key, offForm, sheets, report);
 
-    // Sort by stage id (immutable, DHIS2-assigned) before assigning keys, so the result
-    // is independent of stageRows' Map iteration order — which comes from API page/record
-    // order and is not guaranteed stable run-to-run for a live, changing dataset. This is
-    // the same order discovery's forecast uses, so predicted and actual sheet keys match.
+    // Every repeatable stage gets its sheet, with or without events. Sorted by stage id
+    // (immutable, DHIS2-assigned) before keys are assigned, as discovery's forecast does, so
+    // predicted and actual sheet keys match.
     const usedKeys = new Set<string>([form.key]);
     const stageForms: FormData[] = [];
-    const sortedStageEntries = [...stageRows.entries()].sort(([a], [b]) => a.localeCompare(b));
-    for (const [stageId, rows] of sortedStageEntries) {
-        const stage = meta.stageById.get(stageId);
-        if (!stage) continue;
-
+    const repeatable = [...meta.stageById.values()]
+        .filter(stage => stage.repeatable)
+        .sort((a, b) => a.id.localeCompare(b.id));
+    for (const stage of repeatable) {
         const childKey = assignStageChildKey(form.key, stage, usedKeys);
-        const childOffForm = offForm.get(stageId);
-        const unordered = stageColumns.get(stageId) ?? new Map<string, string>();
+        const childOffForm = offForm.get(stage.id);
+        const unordered = withConfiguredColumns(
+            stageColumns.get(stage.id) ?? new Map<string, string>(),
+            configuredColumns(meta, form.kind, stage)
+        );
         reportOffForm(report, childKey, childOffForm, unordered);
         const childColumns = orderColumns(unordered, meta, childOffForm);
         stageForms.push({
             form: buildStageChildForm(form, stage, childKey),
-            records: rows,
+            records: stageRows.get(stage.id) ?? [],
             columns: childColumns,
             valueTypes: columnValueTypes(childColumns, meta, childOffForm),
+            columnInfo: describeColumns(childColumns, meta, stage),
         });
     }
 
     reportOffForm(report, form.key, offForm.get(""), columns);
-    const mainColumns = orderColumns(columns, meta, offForm.get(""));
+    const mainColumns = orderColumns(
+        withConfiguredColumns(columns, configuredColumns(meta, form.kind)),
+        meta,
+        offForm.get("")
+    );
     return {
         main: {
             form,
             records,
             columns: mainColumns,
             valueTypes: columnValueTypes(mainColumns, meta, offForm.get("")),
+            columnInfo: describeColumns(mainColumns, meta),
         },
         stageForms,
     };
+}
+
+/** Adds the configured columns no record filled to the columns met in the data. */
+function withConfiguredColumns(
+    columns: Map<string, string>,
+    configured: Map<string, string>
+): Map<string, string> {
+    for (const [key, label] of configured) if (!columns.has(key)) columns.set(key, label);
+    return columns;
 }
 
 async function fetchEvents(
@@ -1499,7 +1655,6 @@ async function fetchEvents(
             surveyId: form.surveyLinkField ? values.get(form.surveyLinkField) ?? "" : event.event,
             facilityId: "",
             orgUnit: event.orgUnit ?? "",
-            label: values.get(PREVALENCE_SURVEY_NAME_DATAELEMENT_ID) ?? event.event,
             values,
             meta: new Map<string, string>([
                 ["occurred_at", event.occurredAt ?? ""],
@@ -1522,12 +1677,17 @@ async function fetchEvents(
         report
     );
     reportOffForm(report, form.key, offForm.get(""), columns);
-    const ordered = orderColumns(columns, meta, offForm.get(""));
+    const ordered = orderColumns(
+        withConfiguredColumns(columns, configuredColumns(meta, form.kind)),
+        meta,
+        offForm.get("")
+    );
     return {
         form,
         records,
         columns: ordered,
         valueTypes: columnValueTypes(ordered, meta, offForm.get("")),
+        columnInfo: describeColumns(ordered, meta),
     };
 }
 
@@ -1556,11 +1716,16 @@ async function fetchDataSetNames(
     optionCombos: Map<string, string>;
     /** The dataSet's own attribute option combos (its wards): which values are its own. */
     attributeOptionCombos: Set<string>;
+    /** Attribute option combo -> its ward's name ("W16"), without the specialty. */
+    wardByAoc: Map<string, string>;
 }> {
     const ds = await session.retryWithBackoff(() =>
         api
             .get<{
-                categoryCombo?: { categoryOptionCombos?: NamedRow[] };
+                categoryCombo?: {
+                    categories?: { id: string; categoryOptions?: { id: string }[] }[];
+                    categoryOptionCombos?: (NamedRow & { categoryOptions?: NamedRow[] })[];
+                };
                 dataSetElements?: {
                     dataElement: NamedRow & {
                         formName?: string;
@@ -1570,7 +1735,8 @@ async function fetchDataSetNames(
                 }[];
             }>(`/dataSets/${uid}.json`, {
                 fields:
-                    "categoryCombo[categoryOptionCombos[id,name]]," +
+                    "categoryCombo[categories[id,categoryOptions[id]]," +
+                    "categoryOptionCombos[id,name,categoryOptions[id,name]]]," +
                     "dataSetElements[dataElement[id,name,formName,valueType,categoryCombo[categoryOptionCombos[id,name]]]]",
             })
             .getData()
@@ -1588,7 +1754,19 @@ async function fetchDataSetNames(
     const attributeOptionCombos = new Set(
         (ds.categoryCombo?.categoryOptionCombos ?? []).map(coc => coc.id)
     );
-    return { dataElements, optionCombos, attributeOptionCombos };
+
+    // Ward Summary Statistics combines ward and specialty ("W18, NMW-NSW"); keep the ward only.
+    const wardOptions = new Set(
+        (ds.categoryCombo?.categories ?? [])
+            .filter(category => category.id === WARD_ID_CATEGORY_ID)
+            .flatMap(category => (category.categoryOptions ?? []).map(option => option.id))
+    );
+    const wardByAoc = new Map<string, string>();
+    for (const coc of ds.categoryCombo?.categoryOptionCombos ?? []) {
+        const ward = coc.categoryOptions?.find(option => wardOptions.has(option.id));
+        if (ward) wardByAoc.set(coc.id, ward.name);
+    }
+    return { dataElements, optionCombos, attributeOptionCombos, wardByAoc };
 }
 
 /**
@@ -1657,7 +1835,6 @@ async function fetchDataSet(
             surveyId: "",
             facilityId: "",
             orgUnit: dv.orgUnit ?? "",
-            label: "",
             values: new Map<string, string>([
                 ["period", String(dv.period ?? "")],
                 ["ward", nameOf(dv.attributeOptionCombo)],
@@ -1670,6 +1847,7 @@ async function fetchDataSet(
                 ["stored_by", dv.storedBy ?? ""],
             ]),
             flags: [],
+            wardName: names.wardByAoc.get(dv.attributeOptionCombo ?? ""),
         };
     });
 
@@ -1719,6 +1897,7 @@ export function mergeByFormKey(all: FormData[]): FormData[] {
             records: prior.records.concat(data.records),
             columns,
             valueTypes: new Map([...(prior.valueTypes ?? []), ...(data.valueTypes ?? [])]),
+            columnInfo: new Map([...(data.columnInfo ?? []), ...(prior.columnInfo ?? [])]),
         });
     }
 
@@ -1798,8 +1977,10 @@ function shortStableId(input: string): string {
 }
 
 export type SheetNameSource = {
-    /** Internal graph key (e.g. "Facility", "Facility__WardData"). Doubles as the label. */
+    /** Internal graph key (e.g. "Facility", "Facility__WardData"). */
     key: string;
+    /** The name wanted for the tab (the form's title); the key when absent. */
+    name?: string;
     /** A stable, unique-per-source string to derive a disambiguation suffix from if the
      * sanitized/truncated name collides with another source's. Using each form's own DHIS2
      * uid (not an encounter-order counter) keeps the assignment stable across runs even if
@@ -1825,7 +2006,7 @@ export function assignSheetNames(
     const result = new Map<string, string>();
 
     for (const source of [...sources].sort((a, b) => a.key.localeCompare(b.key))) {
-        const safeLabel = source.key.replace(/[:\\/?*[\]]/g, "-");
+        const safeLabel = (source.name ?? source.key).replace(/[:\\/?*[\]]/g, "-");
         let name = safeLabel.slice(0, EXCEL_SHEET_NAME_MAX);
 
         if (used.has(name)) {
@@ -1866,6 +2047,10 @@ export type IntegrityReport = {
     otherDataSetValues: { formKey: string; count: number }[];
     /** Records for which no Facility could be derived. */
     unresolvedFacility: { formKey: string; count: number }[];
+    /** Case reports whose ward code is not on their facility's ward list (no Ward_id). */
+    unresolvedWard: { formKey: string; count: number }[];
+    /** Org units whose Facility records give different Hospital IDs: ward statistics there get no Facility_code. */
+    ambiguousFacilityCodes: { orgUnit: string; codes: string[] }[];
     /** Stage events whose programStage id did not resolve in program metadata (data was skipped). */
     unresolvedStageEvents: { formKey: string; programStage: string; count: number }[];
     /** Extra events (with data) on a single-entry stage: their values overwrote the earlier event's in the shared row. */
@@ -1886,6 +2071,8 @@ export function emptyIntegrityReport(): IntegrityReport {
         offFormFields: [],
         otherDataSetValues: [],
         unresolvedFacility: [],
+        unresolvedWard: [],
+        ambiguousFacilityCodes: [],
         unresolvedStageEvents: [],
         duplicateStageEvents: [],
         sheetNameCollisions: [],
@@ -1912,11 +2099,20 @@ export function recordUnresolvedStageEvent(
     incrementStageCount(report.unresolvedStageEvents, formKey, programStage);
 }
 
+/** A sheet's readable title from its internal key, for messages. */
+function titleLookup(all: FormData[]): (key: string) => string {
+    const titles = new Map(all.map(d => [d.form.key, d.form.title]));
+    return key => titles.get(key) ?? key;
+}
+
 export function reportIntegrity(report: IntegrityReport, all: FormData[]): void {
+    const titleOf = titleLookup(all);
     const {
         ambiguousFacilities,
         offFormFields,
         unresolvedFacility,
+        unresolvedWard,
+        ambiguousFacilityCodes,
         unresolvedStageEvents,
         duplicateStageEvents,
         sheetNameCollisions,
@@ -1928,6 +2124,8 @@ export function reportIntegrity(report: IntegrityReport, all: FormData[]): void 
         ambiguousFacilities.length === 0 &&
         offFormFields.length === 0 &&
         unresolvedFacility.length === 0 &&
+        unresolvedWard.length === 0 &&
+        ambiguousFacilityCodes.length === 0 &&
         unresolvedStageEvents.length === 0 &&
         duplicateStageEvents.length === 0 &&
         sheetNameCollisions.length === 0 &&
@@ -1950,7 +2148,9 @@ export function reportIntegrity(report: IntegrityReport, all: FormData[]): void 
     }
     if (unresolvedFacility.length > 0) {
         for (const u of unresolvedFacility) {
-            console.warn(`      ${u.formKey}: ${u.count} record(s) with no derivable Facility`);
+            console.warn(
+                `      ${titleOf(u.formKey)}: ${u.count} record(s) with no derivable Facility`
+            );
         }
     }
     if (ambiguousFacilities.length > 0) {
@@ -1958,17 +2158,32 @@ export function reportIntegrity(report: IntegrityReport, all: FormData[]): void 
             `      ambiguous facilities ((survey, orgUnit) matching >1 Facility): ${ambiguousFacilities.length}`
         );
     }
+    for (const u of unresolvedWard) {
+        console.warn(
+            `      ${titleOf(u.formKey)}: ${
+                u.count
+            } record(s) whose ward is not on their facility's ward list`
+        );
+    }
+    if (ambiguousFacilityCodes.length > 0) {
+        console.warn(
+            `      org units with conflicting Hospital IDs (ward statistics there have no Facility_code): ${ambiguousFacilityCodes.length}`
+        );
+    }
     if (unresolvedStageEvents.length > 0) {
         for (const u of unresolvedStageEvents) {
             console.warn(
-                `      ${u.formKey}: ${u.count} event(s) on unresolvable stage ${u.programStage} SKIPPED (data lost)`
+                `      ${titleOf(u.formKey)}: ${u.count} event(s) on unresolvable stage ${
+                    u.programStage
+                } SKIPPED (data lost)`
             );
         }
     }
     for (const u of duplicateStageEvents) {
         console.warn(
-            `      ${u.formKey}: ${u.count} extra event(s) on single-entry stage ${u.programStage}; ` +
-                `their values overwrote the earlier event's`
+            `      ${titleOf(u.formKey)}: ${u.count} extra event(s) on single-entry stage ${
+                u.programStage
+            }; ` + `their values overwrote the earlier event's`
         );
     }
     if (sheetNameCollisions.length > 0) {
@@ -1979,7 +2194,7 @@ export function reportIntegrity(report: IntegrityReport, all: FormData[]): void 
             `      fields deleted from DHIS2 metadata (header shows the raw id): ${unresolvedHeaders.length}`
         );
         for (const h of unresolvedHeaders) {
-            console.warn(`        ${h.formKey}: ${h.kind} ${h.id}`);
+            console.warn(`        ${titleOf(h.formKey)}: ${h.kind} ${h.id}`);
         }
     }
 }
@@ -2036,6 +2251,295 @@ export function resolveFacilityIds(
     }
 }
 
+/** How many parent links lie between a sheet and its root; sorting by it puts parents first. */
+function formDepth(data: FormData, byKey: Map<string, FormData>): number {
+    const parent = data.form.parentKey ? byKey.get(data.form.parentKey) : undefined;
+    return parent && parent !== data ? 1 + formDepth(parent, byKey) : 0;
+}
+
+const trimmed = (value: string | undefined) => (value ?? "").trim();
+
+/** Cyrillic capitals that look exactly like Latin ones (Kyrgyz keyboards type "С3" for "C3"). */
+const LATIN_LOOK_ALIKES: Record<string, string> = {
+    А: "A",
+    В: "B",
+    Е: "E",
+    К: "K",
+    М: "M",
+    Н: "H",
+    О: "O",
+    Р: "P",
+    С: "C",
+    Т: "T",
+    Х: "X",
+};
+
+/**
+ * A code as compared, so how it was typed does not count: case, spaces, leading zeros, a
+ * trailing slash and Cyrillic look-alike letters ("hf025/ w1" = "HF025/W01", "HF025/" =
+ * "HF025", Cyrillic "С3" = "C3"). On preprod (Oct 2026) most apparent mismatches were only that.
+ */
+export function codeKey(code: string): string {
+    return code
+        .toUpperCase()
+        .replace(/[АВЕКМНОРСТХ]/g, letter => LATIN_LOOK_ALIKES[letter] ?? letter)
+        .replace(/\s+/g, "")
+        .replace(/(?<!\d)0+(?=\d)/g, "")
+        .replace(/\/+$/, "");
+}
+
+/** A ward typed without its facility ("W16") written in full ("HF025/W16"), as ward lists are. */
+export function fullWardCode(ward: string, facility: string): string {
+    const bare = !ward.includes("/") && !codeKey(ward).startsWith(codeKey(facility));
+    return ward && facility && bare ? `${facility}/${ward}` : ward;
+}
+
+/** The Facility form's repeatable "Ward data" sheet(s): one row per ward of a hospital. */
+function facilityWardSheets(all: FormData[], facilityKey: string | undefined): FormData[] {
+    if (!facilityKey) return [];
+    return all.filter(
+        d =>
+            d.form.kind === "trackerStage" &&
+            d.form.parentKey === facilityKey &&
+            d.records.some(r => r.values.has(FACILITY_WARD_CODE_DATAELEMENT_ID))
+    );
+}
+
+/**
+ * Fills each record's readable codes (survey name, facility, ward and patient codes) and its
+ * Ward_id. Needs Facility_id resolved first (resolveFacilityIds).
+ *
+ * - Survey name: looked up by Survey_id from the Survey sheet.
+ * - Facility: its Hospital ID. Its ward-data rows: that, plus their own ward code.
+ * - Case report: the facility, ward and patient codes typed on it. A ward typed without its
+ *   facility ("W16", 412 Malawi case reports on preprod) is written in full (fullWardCode).
+ * - Forms filled for a case report's patient: facility and ward from the case report (where
+ *   the patient was admitted is the case report's to say), but their OWN patient code, so a
+ *   typo there stays visible (see flagIdMismatches).
+ * - Ward statistics: the Hospital ID of the Facility record at the same org unit, and the
+ *   ward written as the forms write it (HF025 + W16 -> HF025/W16).
+ *
+ * Ward_id is derived like Facility_id, as the app stores no such link: the ward-data row of
+ * the case report's facility whose ward code matches (by codeKey); forms below the case
+ * report copy it.
+ */
+export function resolveReadableCodes(
+    all: FormData[],
+    recordIndex: Map<string, Map<string, Record_>>,
+    facilityKey: string | undefined,
+    report: IntegrityReport
+): void {
+    const byKey = new Map(all.map(d => [d.form.key, d]));
+    const surveyData = all.find(d => d.form.defaultUid === PREVALENCE_SURVEY_FORM_ID);
+    const surveyNames = new Map(
+        (surveyData?.records ?? []).map(r => [
+            r.id,
+            trimmed(r.values.get(PREVALENCE_SURVEY_NAME_DATAELEMENT_ID)),
+        ])
+    );
+    const parentOf = (data: FormData, record: Record_) =>
+        data.form.parentKey
+            ? recordIndex.get(data.form.parentKey)?.get(record.parentId)
+            : undefined;
+
+    const ordered = all
+        .filter(d => d.form.kind !== "dataSet")
+        .sort((a, b) => formDepth(a, byKey) - formDepth(b, byKey));
+
+    for (const data of ordered) {
+        const { form } = data;
+        for (const record of data.records) {
+            const own = (field: string) => trimmed(record.values.get(field));
+            const survey = surveyNames.get(record.surveyId) ?? "";
+            const parent = parentOf(data, record)?.codes ?? NO_CODES;
+
+            if (form.kind === "trackerStage") {
+                record.codes = {
+                    ...parent,
+                    ward:
+                        fullWardCode(own(FACILITY_WARD_CODE_DATAELEMENT_ID), parent.facility) ||
+                        parent.ward,
+                };
+            } else if (form.defaultUid === PREVALENCE_SURVEY_FORM_ID) {
+                record.codes = { ...NO_CODES, survey };
+            } else if (form.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID) {
+                record.codes = {
+                    ...NO_CODES,
+                    survey,
+                    facility: own(AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID),
+                };
+            } else if (form.defaultUid === PREVALENCE_CASE_REPORT_FORM_ID) {
+                const facility = own(CASE_REPORT_FACILITY_CODE_TEA);
+                record.codes = {
+                    survey,
+                    facility,
+                    ward: fullWardCode(own(CASE_REPORT_WARD_CODE_TEA), facility),
+                    patient: own(AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID),
+                };
+            } else {
+                record.codes = {
+                    ...parent,
+                    survey,
+                    patient: own(AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID),
+                };
+            }
+        }
+    }
+
+    // (facility record id + ward code) -> ward-data record id.
+    const wardSheets = facilityWardSheets(all, facilityKey);
+    const wardIndex = new Map<string, string>();
+    const facilitiesWithWards = new Set<string>();
+    for (const ward of wardSheets.flatMap(d => d.records)) {
+        if (!ward.codes?.ward) continue;
+        facilitiesWithWards.add(ward.parentId);
+        const key = `${ward.parentId}|${codeKey(ward.codes.ward)}`;
+        if (!wardIndex.has(key)) wardIndex.set(key, ward.id);
+    }
+    for (const data of ordered) {
+        if (wardSheets.includes(data)) continue;
+        let unresolved = 0;
+        for (const record of data.records) {
+            if (data.form.defaultUid !== PREVALENCE_CASE_REPORT_FORM_ID) {
+                record.wardId = parentOf(data, record)?.wardId ?? "";
+                continue;
+            }
+            const ward = record.codes?.ward ?? "";
+            record.wardId = (ward && wardIndex.get(`${record.facilityId}|${codeKey(ward)}`)) || "";
+            if (ward && !record.wardId && facilitiesWithWards.has(record.facilityId)) unresolved++;
+        }
+        if (unresolved > 0)
+            report.unresolvedWard.push({ formKey: data.form.key, count: unresolved });
+    }
+
+    // Ward statistics: org unit -> the Hospital IDs its Facility records give.
+    const facilityCodes = new Map<string, Set<string>>();
+    for (const facility of (facilityKey && byKey.get(facilityKey)?.records) || []) {
+        if (!facility.codes?.facility) continue;
+        const codes = facilityCodes.get(facility.orgUnit) ?? new Set<string>();
+        codes.add(facility.codes.facility);
+        facilityCodes.set(facility.orgUnit, codes);
+    }
+    const ambiguous = new Set<string>();
+    for (const data of all.filter(d => d.form.kind === "dataSet")) {
+        for (const record of data.records) {
+            const codes = [...(facilityCodes.get(record.orgUnit) ?? [])];
+            if (codes.length > 1) ambiguous.add(record.orgUnit);
+            const [facility = ""] = codes.length === 1 ? codes : [];
+            record.codes = {
+                ...NO_CODES,
+                facility,
+                ward: facility ? fullWardCode(record.wardName ?? "", facility) : "",
+            };
+        }
+    }
+    for (const orgUnit of ambiguous) {
+        const codes = [...(facilityCodes.get(orgUnit) ?? [])].sort();
+        report.ambiguousFacilityCodes.push({ orgUnit, codes });
+    }
+}
+
+/**
+ * Flags records whose typed codes disagree, compared by codeKey (case, spaces, leading zeros
+ * and a trailing slash do not count; a blank is never a mismatch):
+ * - case report: its facility code vs its Facility record's Hospital ID; its ward vs that
+ *   facility's ward list; and the nesting (ward = facility/..., patient = ward/...);
+ * - forms filled for a case report's patient: their patient ID vs the case report's, and
+ *   their own patient ID field (if any) vs their patient ID, with or without "/C3".
+ *
+ * Runs after flagRecords, so an ID MISMATCH does not mark every child of a case report as
+ * PARENT FLAGGED: the DHIS2 links still hold, only the typed codes differ.
+ */
+export function flagIdMismatches(
+    all: FormData[],
+    recordIndex: Map<string, Map<string, Record_>>,
+    facilityKey: string | undefined
+): void {
+    const byKey = new Map(all.map(d => [d.form.key, d]));
+    const facilities = facilityKey ? recordIndex.get(facilityKey) : undefined;
+    const wardsByFacility = new Map<string, Set<string>>();
+    for (const ward of facilityWardSheets(all, facilityKey).flatMap(d => d.records)) {
+        if (!ward.codes?.ward) continue;
+        const wards = wardsByFacility.get(ward.parentId) ?? new Set<string>();
+        wards.add(codeKey(ward.codes.ward));
+        wardsByFacility.set(ward.parentId, wards);
+    }
+    const same = (a: string, b: string) => codeKey(a) === codeKey(b);
+    const within = (code: string, parent: string) =>
+        codeKey(code).startsWith(`${codeKey(parent)}/`);
+    const mismatch = (record: Record_, detail: string) =>
+        addFlag(record, { flag: "ID MISMATCH", detail });
+
+    for (const data of all) {
+        if (data.form.kind === "trackerStage" || data.form.kind === "dataSet") continue;
+        const parent = data.form.parentKey ? byKey.get(data.form.parentKey) : undefined;
+        const caseReports =
+            parent?.form.defaultUid === PREVALENCE_CASE_REPORT_FORM_ID
+                ? recordIndex.get(parent.form.key)
+                : undefined;
+        const isCaseReport = data.form.defaultUid === PREVALENCE_CASE_REPORT_FORM_ID;
+        if (!isCaseReport && !caseReports) continue;
+
+        for (const record of data.records) {
+            const { facility, ward, patient } = record.codes ?? NO_CODES;
+            if (caseReports) {
+                const caseReport = caseReports.get(record.parentId);
+                const expected = caseReport?.codes?.patient ?? "";
+                if (patient && expected && !same(patient, expected)) {
+                    mismatch(
+                        record,
+                        `Unique survey patient ID "${patient}" differs from its case report's "${expected}"`
+                    );
+                }
+                const own = ownPatientId(record);
+                if (own && patient && !same(own, patient) && !same(own, `${patient}/C3`)) {
+                    mismatch(
+                        record,
+                        `This form's own patient ID field "${own}" is neither its Unique survey patient ID "${patient}" nor that + /C3`
+                    );
+                }
+                continue;
+            }
+
+            const hospitalId = facilities?.get(record.facilityId)?.codes?.facility ?? "";
+            if (facility && hospitalId && !same(facility, hospitalId)) {
+                mismatch(
+                    record,
+                    `Unique facility ID "${facility}" differs from its facility's on the Facility form ("${hospitalId}")`
+                );
+            }
+            const wards = wardsByFacility.get(record.facilityId);
+            if (ward && wards && !wards.has(codeKey(ward))) {
+                mismatch(
+                    record,
+                    `Unique ward ID "${ward}" is not among its facility's wards on the Facility form`
+                );
+            }
+            if (facility && ward && !within(ward, facility)) {
+                mismatch(
+                    record,
+                    `Unique ward ID "${ward}" does not start with its Unique facility ID "${facility}/"`
+                );
+            }
+            if (ward && patient && !within(patient, ward)) {
+                mismatch(
+                    record,
+                    `Unique survey patient ID "${patient}" does not start with its Unique ward ID "${ward}/"`
+                );
+            }
+        }
+    }
+}
+
+/** The form's own patient ID field (see OWN_PATIENT_ID_TEAS), trimmed; "" if none. */
+function ownPatientId(record: Record_): string {
+    for (const id of OWN_PATIENT_ID_TEAS) {
+        const value = trimmed(record.values.get(id));
+        if (value) return value;
+    }
+    return "";
+}
+
 /** What DHIS2 says about an id that records point at but this extract does not contain. */
 export type ReferenceStatus =
     | { status: "deleted"; lastUpdated: string }
@@ -2072,7 +2576,7 @@ function referenceFlag(
         };
     }
     return isSurvey
-        ? { flag: "TEST/INVALID", detail: `Survey_id "${id}" is not a survey in DHIS2` }
+        ? { flag: "TEST/INVALID", detail: `Survey record ID "${id}" is not a survey in DHIS2` }
         : { flag: "PARENT MISSING", detail: `${what} "${id}" does not exist in DHIS2` };
 }
 
@@ -2099,10 +2603,6 @@ export async function flagRecords(
     const byKey = new Map(all.map(d => [d.form.key, d]));
     const survey = all.find(d => d.form.defaultUid === PREVALENCE_SURVEY_FORM_ID);
     const surveys = survey && recordIndex.get(survey.form.key);
-    const depth = (data: FormData): number => {
-        const parent = data.form.parentKey ? byKey.get(data.form.parentKey) : undefined;
-        return parent && parent !== data ? 1 + depth(parent) : 0;
-    };
 
     const checks = all
         .filter(data => data.form.kind !== "dataSet" && data !== survey)
@@ -2116,7 +2616,7 @@ export async function flagRecords(
                 parent: parent && parent !== survey ? parent : undefined,
             };
         })
-        .sort((a, b) => depth(a.data) - depth(b.data));
+        .sort((a, b) => formDepth(a.data, byKey) - formDepth(b.data, byKey));
 
     const danglingSurveys = new Set<string>();
     const danglingParents = new Set<string>();
@@ -2143,7 +2643,10 @@ export async function flagRecords(
         for (const record of data.records) {
             if (checkSurvey) {
                 if (!record.surveyId)
-                    addFlag(record, { flag: "TEST/INVALID", detail: "No Survey_id recorded" });
+                    addFlag(record, {
+                        flag: "TEST/INVALID",
+                        detail: "No Survey record ID recorded",
+                    });
                 else if (!surveys?.has(record.surveyId)) {
                     addFlag(
                         record,
@@ -2158,14 +2661,17 @@ export async function flagRecords(
             }
             if (!parent || !parents) continue;
 
-            const parentKey = parent.form.key;
+            const parentName = parent.form.title;
             const parentRecord = record.parentId ? parents.get(record.parentId) : undefined;
             if (!record.parentId) {
-                addFlag(record, { flag: "PARENT MISSING", detail: `No ${parentKey} id recorded` });
+                addFlag(record, {
+                    flag: "PARENT MISSING",
+                    detail: `No ${parentName} record ID recorded`,
+                });
             } else if (!parentRecord) {
                 addFlag(
                     record,
-                    referenceFlag(parentKey, record.parentId, statuses.get(record.parentId), false)
+                    referenceFlag(parentName, record.parentId, statuses.get(record.parentId), false)
                 );
             } else {
                 if (
@@ -2176,14 +2682,14 @@ export async function flagRecords(
                 ) {
                     addFlag(record, {
                         flag: "SURVEY MISMATCH",
-                        detail: `Survey_id ${record.surveyId}, but its ${parentKey} ${parentRecord.id} has ${parentRecord.surveyId}`,
+                        detail: `Survey record ID ${record.surveyId}, but its ${parentName} ${parentRecord.id} has ${parentRecord.surveyId}`,
                     });
                 }
                 if (parentRecord.flags.length > 0) {
                     const kinds = [...new Set(parentRecord.flags.map(f => f.flag))].join(", ");
                     addFlag(record, {
                         flag: "PARENT FLAGGED",
-                        detail: `${parentKey} ${parentRecord.id} is flagged: ${kinds}`,
+                        detail: `${parentName} ${parentRecord.id} is flagged: ${kinds}`,
                     });
                 }
             }
@@ -2200,7 +2706,7 @@ export function summariseFlags(
         for (const record of data.records) {
             for (const flag of new Set(record.flags.map(f => f.flag))) {
                 const key = `${data.form.key}|${flag}`;
-                const row = counts.get(key) ?? { sheet: data.form.key, flag, count: 0 };
+                const row = counts.get(key) ?? { sheet: data.form.title, flag, count: 0 };
                 row.count++;
                 counts.set(key, row);
             }
@@ -2281,76 +2787,347 @@ async function lookUpReferences(
     return statuses;
 }
 
-/**
- * Human-readable lineage, e.g. "Kenya PPS 2024 > Patient 0187 > D28". Walks the FK chain
- * (Survey -> Case report -> leaf); Facility is not on that chain because no FK exists, so
- * it does not appear here — see the Facility_id column instead.
- */
-export function buildBreadcrumb(
-    form: ResolvedForm,
-    record: Record_,
-    byKey: Map<string, FormData>,
-    recordIndex: Map<string, Map<string, Record_>>
-): string {
-    const parts: string[] = [];
-
-    let currentForm: ResolvedForm | undefined = form;
-    let currentRecord: Record_ | undefined = record;
+/** True for Case report and every sheet below it: the sheets with a patient's ward. */
+function isCaseReportOrBelow(form: ResolvedForm, byKey: Map<string, FormData>): boolean {
     const seen = new Set<string>();
-
-    while (currentForm?.parentKey) {
-        const parentData = byKey.get(currentForm.parentKey);
-        if (!parentData || !currentRecord) break;
-
-        const parentId: string = currentRecord.parentId;
-        if (!parentId || seen.has(parentId)) break;
-        seen.add(parentId);
-
-        const parentRecord: Record_ | undefined = recordIndex
-            .get(currentForm.parentKey)
-            ?.get(parentId);
-
-        parts.unshift(parentRecord?.label || parentId);
-
-        currentForm = parentData.form;
-        currentRecord = parentRecord;
+    for (
+        let current: ResolvedForm | undefined = form;
+        current && !seen.has(current.key);
+        current = current.parentKey ? byKey.get(current.parentKey)?.form : undefined
+    ) {
+        if (current.defaultUid === PREVALENCE_CASE_REPORT_FORM_ID) return true;
+        seen.add(current.key);
     }
-
-    parts.push(record.label || record.id);
-    return parts.join(" > ");
+    return false;
 }
 
-export type KeyColumn = { header: string; get: (record: Record_) => string };
+/** What one row of a sheet is, which decides its identification columns. */
+type SheetRole = "survey" | "facility" | "wards" | "caseReport" | "patientForm" | "wardStatistics";
+
+function sheetRole(form: ResolvedForm, byKey: Map<string, FormData>): SheetRole {
+    if (form.kind === "dataSet") return "wardStatistics";
+    if (form.defaultUid === PREVALENCE_SURVEY_FORM_ID) return "survey";
+    if (form.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID) return "facility";
+    if (form.defaultUid === PREVALENCE_CASE_REPORT_FORM_ID) return "caseReport";
+    return isCaseReportOrBelow(form, byKey) ? "patientForm" : "wards";
+}
 
 /**
- * The ancestor key columns for a sheet, in a fixed order. Survey_id is read directly from
- * the record's own survey-link attribute (no chain walking); Facility_id is derived from
- * (Survey_id, org_unit_id); the immediate-parent column is only added when the parent is
- * not the Survey itself (i.e. CaseReport_id on the 8 leaf forms).
+ * The four column groups of every form sheet, left to right. Identification and data check
+ * stay on screen while scrolling; the DHIS2 linking and system group starts collapsed.
  */
-export function keyColumnsFor(form: ResolvedForm, byKey: Map<string, FormData>): KeyColumn[] {
+export type ColumnGroup = "identification" | "check" | "form" | "system";
+
+export const COLUMN_GROUPS: Record<ColumnGroup, { name: string; fill: string }> = {
+    identification: { name: "Identification", fill: "FFBDD7EE" },
+    check: { name: "Data check", fill: "FFF8CBAD" },
+    form: { name: "Form question", fill: "FFE2EFDA" },
+    system: { name: "DHIS2 linking and system", fill: "FFD9D9D9" },
+};
+
+/** Every other form section gets this shade instead, so sections show as bands. */
+const ALTERNATE_SECTION_FILL = "FFFFF2CC";
+
+/** One column of a form sheet: its header, its group, and where its value comes from. */
+export type SheetColumn = {
+    header: string;
+    group: ColumnGroup;
+    /** For form questions: the form section, which bands the header colours. */
+    section?: string;
+    /** Where the value comes from, in plain words: the header note and the Column guide. */
+    about: string;
+    valueType?: string;
+    get: (record: Record_) => string;
+};
+
+/** The DHIS2 system columns of each kind of sheet, as the record builders fill `meta`. */
+const META_KEYS_BY_KIND: Record<FormKind, readonly string[]> = {
+    tracker: ["created_at", "updated_at", "enrolled_at", "status", "program"],
+    trackerStage: ["occurred_at", "status", "program"],
+    event: ["occurred_at", "created_at", "updated_at", "status", "program"],
+    dataSet: ["last_updated", "stored_by"],
+};
+
+const META_COLUMNS: Record<string, { header: string; about: string }> = {
+    created_at: { header: "Date entered", about: "When the record was first saved in DHIS2." },
+    updated_at: { header: "Last changed", about: "When the record was last changed in DHIS2." },
+    last_updated: { header: "Last changed", about: "When the value was last changed in DHIS2." },
+    enrolled_at: { header: "Enrolled on", about: "The record's enrolment date in DHIS2." },
+    occurred_at: { header: "Event date", about: "The date DHIS2 holds for this form." },
+    status: { header: "Status", about: "DHIS2 status: ACTIVE (open) or COMPLETED." },
+    program: {
+        header: "Form version",
+        about: "The DHIS2 program the row comes from: the default form or a country's custom version of it.",
+    },
+    stored_by: { header: "Entered by", about: "The DHIS2 user who saved the value." },
+};
+
+/** Meta columns holding DHIS2 timestamps, written as real date-times. */
+const META_DATETIME_KEYS = new Set([
+    "created_at",
+    "updated_at",
+    "enrolled_at",
+    "occurred_at",
+    "last_updated",
+]);
+
+const DATASET_COLUMN_ABOUT: Record<string, string> = {
+    period: "The period the statistics are for.",
+    ward: "The ward (and, on Ward summary statistics, the specialty) the statistics are for.",
+    data_element: "The statistic.",
+    disaggregation: "Its breakdown, where it has one.",
+    value: "The value.",
+};
+
+/**
+ * The link columns, in the DHIS2 linking and system group. Survey record ID is read from the
+ * record's own survey-link field; Facility record ID is worked out from the survey and
+ * facility, Ward record ID from that and the Unique ward ID (resolveFacilityIds,
+ * resolveReadableCodes); the parent's record ID is added when the parent is not the Survey.
+ */
+export function linkColumnsFor(form: ResolvedForm, byKey: Map<string, FormData>): SheetColumn[] {
     if (form.kind === "dataSet") return [];
+    const role = sheetRole(form, byKey);
+    const link = (header: string, about: string, get: (r: Record_) => string): SheetColumn => ({
+        header,
+        group: "system",
+        about,
+        get,
+    });
+    const cols: SheetColumn[] = [];
 
-    const isSurvey = form.defaultUid === PREVALENCE_SURVEY_FORM_ID;
-    const isFacility = form.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID;
-    const cols: KeyColumn[] = [];
-
-    if (!isSurvey) cols.push({ header: "Survey_id", get: r => r.surveyId });
-    if (!isSurvey && !isFacility) cols.push({ header: "Facility_id", get: r => r.facilityId });
-
-    const parentForm = form.parentKey ? byKey.get(form.parentKey)?.form : undefined;
-    if (parentForm && parentForm.defaultUid !== PREVALENCE_SURVEY_FORM_ID) {
-        const header = `${parentForm.key}_id`;
-        // Avoid a duplicate header: e.g. a repeatable stage owned directly by Facility
-        // would otherwise get "Facility_id" twice — once derived (isFacility check
-        // above doesn't apply to the child), once as its immediate-parent key. Both
-        // hold the same value in that case (the parent record IS the Facility record),
-        // so keeping just the derived column is correct, not just cosmetic.
-        if (!cols.some(c => c.header === header)) {
-            cols.push({ header, get: r => r.parentId });
-        }
+    if (role !== "survey") {
+        cols.push(
+            link(
+                "Survey record ID",
+                "DHIS2 id of the survey: the Record ID of its row on the Survey sheet. Read from the form's Survey ID field.",
+                r => r.surveyId
+            )
+        );
+    }
+    if (role !== "survey" && role !== "facility") {
+        cols.push(
+            link(
+                "Facility record ID",
+                "The Record ID of this facility's row on the Facility sheet, for this survey. Worked out by the extract from the survey and facility: the app stores no such link.",
+                r => r.facilityId
+            )
+        );
+    }
+    if (role === "caseReport" || role === "patientForm") {
+        cols.push(
+            link(
+                "Ward record ID",
+                "The Record ID of the patient's ward on the Facility - Ward data sheet. Worked out by the extract from the facility and the case report's Unique ward ID.",
+                r => r.wardId ?? ""
+            )
+        );
+    }
+    // A Facility stage's parent IS its facility: Facility record ID already says so.
+    const parent = form.parentKey ? byKey.get(form.parentKey)?.form : undefined;
+    if (parent && parent.defaultUid !== PREVALENCE_SURVEY_FORM_ID && role !== "wards") {
+        cols.push(
+            link(
+                `${parent.title} record ID`,
+                `The Record ID of the ${parent.title} row this record belongs to.`,
+                r => r.parentId
+            )
+        );
     }
     return cols;
+}
+
+/** Fields shown in the identification group or the link columns, so not again as questions. */
+function fieldsShownElsewhere(form: ResolvedForm, role: SheetRole): Set<string> {
+    const moved: Record<SheetRole, string[]> = {
+        survey: [PREVALENCE_SURVEY_NAME_DATAELEMENT_ID],
+        facility: [AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID],
+        wards: [FACILITY_WARD_CODE_DATAELEMENT_ID],
+        caseReport: [
+            CASE_REPORT_FACILITY_CODE_TEA,
+            CASE_REPORT_WARD_CODE_TEA,
+            AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID,
+        ],
+        patientForm:
+            form.kind === "trackerStage" ? [] : [AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID],
+        wardStatistics: [],
+    };
+    const links = [form.surveyLinkField, ...form.parentLinkField.split("; ")];
+    return new Set([...moved[role], ...links].filter(Boolean));
+}
+
+const FROM_CASE_REPORT_SUFFIX = " (from case report)";
+const OWN_FIELD_SUFFIX = " (this form's own field)";
+
+/** The identification group of a sheet: what a reader needs to know which record a row is. */
+function identificationColumns(role: SheetRole, orgUnitNames: Map<string, string>): SheetColumn[] {
+    const id = (header: string, about: string, get: (r: Record_) => string): SheetColumn => ({
+        header,
+        group: "identification",
+        about,
+        get,
+    });
+    const place = (header: string, about: string) =>
+        id(header, about, r => orgUnitNames.get(r.orgUnit) ?? "");
+    const fromCase = role === "patientForm";
+    const fromCaseSuffix = fromCase ? FROM_CASE_REPORT_SUFFIX : "";
+    const completed = "A ward typed without its facility (W16) is shown in full (HF025/W16).";
+
+    const surveyName = id(
+        "Survey name",
+        role === "survey"
+            ? `The survey's name, as typed on the Survey form (SurveyName, ${PREVALENCE_SURVEY_NAME_DATAELEMENT_ID}).`
+            : "The name of the survey this record belongs to, from the Survey sheet. Filter it to keep one survey.",
+        r => r.codes?.survey ?? ""
+    );
+    const facilityName = place("Facility name", "The facility the record was entered under.");
+    const facilityId = id(
+        `Unique facility ID${fromCaseSuffix}`,
+        {
+            survey: "",
+            facility: `As typed on the Facility form, where the field is called "Hospital ID" (${AMR_SURVEYS_PREVALENCE_TEA_HOSPITAL_ID}).`,
+            wards: `The facility's Unique facility ID ("Hospital ID" on the Facility form).`,
+            caseReport: `As typed on the case report (Unique facility ID, ${CASE_REPORT_FACILITY_CODE_TEA}).`,
+            patientForm: "Copied from the patient's case report.",
+            wardStatistics:
+                'The Unique facility ID ("Hospital ID") on this facility\'s Facility form.',
+        }[role],
+        r => r.codes?.facility ?? ""
+    );
+    const wardId = id(
+        `Unique ward ID${fromCaseSuffix}`,
+        {
+            survey: "",
+            facility: "",
+            wards: `As typed in the Facility form's Ward data (Unique ward ID, ${FACILITY_WARD_CODE_DATAELEMENT_ID}). ${completed}`,
+            caseReport: `As typed on the case report (Unique ward/department ID, ${CASE_REPORT_WARD_CODE_TEA}). ${completed}`,
+            patientForm: "Copied from the patient's case report.",
+            wardStatistics:
+                "The facility's Unique facility ID + / + the ward of the statistics (e.g. HF025/W16).",
+        }[role],
+        r => r.codes?.ward ?? ""
+    );
+    const patientId = id(
+        "Unique survey patient ID",
+        role === "caseReport"
+            ? `As typed on the case report (${AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID}).`
+            : `As typed on this form (${AMR_SURVEYS_PREVALENCE_TEA_UNIQUE_PATIENT_ID}). It should match the case report's; a difference is a data check.`,
+        r => r.codes?.patient ?? ""
+    );
+
+    switch (role) {
+        case "survey":
+            return [surveyName, place("Country", "The country the survey is registered in.")];
+        case "facility":
+            return [surveyName, facilityName, facilityId];
+        case "wards":
+            return [surveyName, facilityName, facilityId, wardId];
+        case "caseReport":
+        case "patientForm":
+            return [surveyName, facilityName, facilityId, wardId, patientId];
+        case "wardStatistics":
+            return [facilityName, facilityId, wardId];
+    }
+}
+
+const CHECK_COLUMNS: SheetColumn[] = [
+    {
+        header: "Data check",
+        group: "check",
+        about: "Warnings the extract adds, e.g. test data, a parent record deleted or missing, IDs that disagree. Empty means no warning. The Read me sheet explains each one.",
+        get: r => [...new Set(r.flags.map(f => f.flag))].join("; "),
+    },
+    {
+        header: "Data check details",
+        group: "check",
+        about: "Why the row has a warning.",
+        get: r => r.flags.map(f => f.detail).join("; "),
+    },
+];
+
+/**
+ * Every column of a form sheet, left to right: identification, data check, the form's
+ * questions in form order (fields already shown as identification or link columns are not
+ * repeated), then DHIS2 linking and system. The sheet writer, the Column guide and
+ * discovery's forecast all use this, so they always agree.
+ */
+export function sheetColumns(
+    data: FormData,
+    byKey: Map<string, FormData>,
+    orgUnitNames: Map<string, string> = new Map()
+): SheetColumn[] {
+    const { form } = data;
+    const role = sheetRole(form, byKey);
+    const identification = identificationColumns(role, orgUnitNames);
+
+    const system: SheetColumn[] = [
+        {
+            header: "Record ID",
+            group: "system",
+            about: "This row's id in DHIS2. Other sheets point at it in their record ID columns.",
+            get: r => r.id,
+        },
+        ...linkColumnsFor(form, byKey),
+        {
+            header: "DHIS2 org unit ID",
+            group: "system",
+            about: "DHIS2's id of the facility (or country) the record was entered under.",
+            get: r => r.orgUnit,
+        },
+        ...META_KEYS_BY_KIND[form.kind].map(
+            (key): SheetColumn => ({
+                ...(META_COLUMNS[key] ?? { header: key, about: "" }),
+                group: "system",
+                valueType: META_DATETIME_KEYS.has(key) ? "DATETIME" : undefined,
+                get: r => r.meta.get(key) ?? "",
+            })
+        ),
+    ];
+
+    // A form's own copy of an identification field (the follow-up form's "Unique facility
+    // ID") is told apart from the identification column it would otherwise look like.
+    const hidden = fieldsShownElsewhere(form, role);
+    const idNames = new Set(identification.map(c => c.header.replace(FROM_CASE_REPORT_SUFFIX, "")));
+    const shown = new Map(
+        [...data.columns]
+            .filter(([key]) => {
+                const id = key.startsWith(STAGE_COLUMN_PREFIX)
+                    ? key.slice(STAGE_COLUMN_PREFIX.length)
+                    : key;
+                return !hidden.has(id);
+            })
+            .map(([key, label]) => [
+                key,
+                idNames.has(label) ? `${label}${OWN_FIELD_SUFFIX}` : label,
+            ])
+    );
+    const dhis2Names = new Map(
+        [...(data.columnInfo ?? [])].map(([key, info]) => [key, info.dhis2Name])
+    );
+    const reserved = new Set([...identification, ...CHECK_COLUMNS, ...system].map(c => c.header));
+    const questions = [...uniqueLabels(shown, dhis2Names, reserved)].map(
+        ([key, header]): SheetColumn => {
+            const info = data.columnInfo?.get(key);
+            const about =
+                form.kind === "dataSet"
+                    ? DATASET_COLUMN_ABOUT[key] ?? ""
+                    : info?.dhis2Name
+                    ? `${info.section ? `${info.section}. ` : ""}DHIS2 field: ${info.dhis2Name} (${
+                          info.id
+                      }).`
+                    : "No longer on the form; values entered before it was removed are kept.";
+            return {
+                header,
+                group: "form",
+                section: form.kind === "dataSet" ? "Ward statistics" : info?.section ?? "",
+                about,
+                valueType: data.valueTypes?.get(key),
+                get: r => r.values.get(key) ?? "",
+            };
+        }
+    );
+
+    return [...identification, ...CHECK_COLUMNS, ...questions, ...system];
 }
 
 /** Beyond 15 significant digits Excel silently rounds a number, so such values stay text. */
@@ -2387,63 +3164,67 @@ function columnNumFmt(valueType: string | undefined): string {
     return valueType && NUMERIC_VALUE_TYPES.has(valueType) ? "General" : "@";
 }
 
-/** Meta columns holding DHIS2 timestamps, written as real date-times. */
-const META_DATETIME_KEYS = new Set([
-    "created_at",
-    "updated_at",
-    "enrolled_at",
-    "occurred_at",
-    "last_updated",
-]);
-
 /** Light orange: flagged rows stand out without hiding their content. */
 const FLAG_FILL: Excel.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFD8A8" } };
+
+const solidFill = (argb: string): Excel.Fill => ({
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb },
+});
+
+/** Header colour of each column: its group's, with the form's sections in alternating bands. */
+export function headerFills(columns: SheetColumn[]): string[] {
+    let band = 0;
+    return columns.map((column, i) => {
+        if (column.group !== "form") return COLUMN_GROUPS[column.group].fill;
+        const previous = columns[i - 1];
+        if (previous?.group === "form" && previous.section !== column.section) band++;
+        return band % 2 === 0 ? COLUMN_GROUPS.form.fill : ALTERNATE_SECTION_FILL;
+    });
+}
 
 type Writer = Excel.stream.xlsx.WorkbookWriter;
 
 /**
- * Streams one form sheet. Flag columns come first, so a flagged row is the first thing an
- * epidemiologist sees on it; flagged rows are also shaded, and the header has filters.
+ * Streams one form sheet (columns: sheetColumns). Headers are coloured by group and carry a
+ * note saying where the value comes from; identification and data check stay on screen while
+ * scrolling right; the DHIS2 linking and system group starts collapsed. Flagged rows are shaded.
  */
 export function writeFormSheet(
     workbook: Writer,
     data: FormData,
     byKey: Map<string, FormData>,
-    recordIndex: Map<string, Map<string, Record_>>,
     orgUnitNames: Map<string, string>,
     sheetName: string
 ): void {
     const { form, records } = data;
-    const columns = uniqueLabels(data.columns);
-    const columnUids = [...columns.keys()];
-    const keyColumns = keyColumnsFor(form, byKey);
-    const metaKeys = [...new Set(records.flatMap(r => [...r.meta.keys()]))];
+    const columns = sheetColumns(data, byKey, orgUnitNames);
+    const frozen = columns.filter(c => c.group === "identification" || c.group === "check").length;
 
-    const leading = [
-        "flag",
-        "flag_detail",
-        ...keyColumns.map(c => c.header),
-        "path",
-        "record_id",
-        "org_unit_id",
-        "org_unit_name",
-    ];
-    const header = [...leading, ...metaKeys, ...columns.values()];
-    // One valueType per column: identifiers and codes stay text; timestamps and typed fields don't.
-    const types = [
-        ...leading.map(() => undefined),
-        ...metaKeys.map(k => (META_DATETIME_KEYS.has(k) ? "DATETIME" : undefined)),
-        ...columnUids.map(uid => data.valueTypes?.get(uid)),
-    ];
-
-    const sheet = workbook.addWorksheet(sheetName, { views: [{ state: "frozen", ySplit: 1 }] });
+    const sheet = workbook.addWorksheet(sheetName, {
+        views: [{ state: "frozen", xSplit: frozen, ySplit: 1 }],
+        properties: { outlineLevelCol: 1 },
+    });
     // Streaming writes columns with the first row, so formats are set first, at column level.
     // Text by default, so DHIS2 UIDs and coded values are never re-parsed by Excel as numbers
     // or dates if the sheet is edited.
-    sheet.columns = types.map(type => ({ width: 18, style: { numFmt: columnNumFmt(type) } }));
-    sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: header.length } };
-    const headerRow = sheet.addRow(header);
+    sheet.columns = columns.map(c => ({
+        width: c.group === "form" ? 24 : 20,
+        style: { numFmt: columnNumFmt(c.valueType) },
+        ...(c.group === "system" ? { outlineLevel: 1, hidden: true } : {}),
+    }));
+    sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: columns.length } };
+    const headerRow = sheet.addRow(columns.map(c => c.header));
     headerRow.font = { bold: true };
+    headerRow.height = 48;
+    const fills = headerFills(columns);
+    columns.forEach((column, i) => {
+        const cell = headerRow.getCell(i + 1);
+        cell.fill = solidFill(fills[i] ?? COLUMN_GROUPS.form.fill);
+        cell.alignment = { wrapText: true, vertical: "top" };
+        cell.note = `${COLUMN_GROUPS[column.group].name}. ${column.about}`;
+    });
     headerRow.commit();
 
     if (records.length + 1 > EXCEL_MAX_ROWS) {
@@ -2455,23 +3236,15 @@ export function writeFormSheet(
     }
 
     for (const record of records.slice(0, EXCEL_MAX_ROWS - 1)) {
-        const values = [
-            [...new Set(record.flags.map(f => f.flag))].join("; "),
-            record.flags.map(f => f.detail).join("; "),
-            ...keyColumns.map(c => c.get(record)),
-            buildBreadcrumb(form, record, byKey, recordIndex),
-            record.id,
-            record.orgUnit,
-            orgUnitNames.get(record.orgUnit) ?? "",
-            ...metaKeys.map(k => record.meta.get(k) ?? ""),
-            ...columnUids.map(uid => record.values.get(uid) ?? ""),
-        ];
         // An empty value writes no cell at all: a truly blank cell, and a smaller file.
         const row = sheet.addRow(
-            values.map((value, i) => (value === "" ? null : toCellValue(value, types[i])))
+            columns.map(c => {
+                const value = c.get(record);
+                return value === "" ? null : toCellValue(value, c.valueType);
+            })
         );
         if (record.flags.length > 0) {
-            for (let column = 1; column <= header.length; column++)
+            for (let column = 1; column <= columns.length; column++)
                 row.getCell(column).fill = FLAG_FILL;
         }
         row.commit();
@@ -2480,96 +3253,257 @@ export function writeFormSheet(
 }
 
 /**
- * Machine-readable relationship contract: one row per sheet giving its primary key, parent
- * key, ancestor keys, expected cardinality and an example join. Downstream tools (Power BI,
- * SQL loaders) can read this sheet instead of hard-coding the model.
+ * A data dictionary: one row per column of every form sheet, with its group, form section,
+ * where its value comes from and how many rows fill it.
  */
-export function writeRelationshipsSheet(
+export function writeColumnGuideSheet(
     workbook: Writer,
     all: FormData[],
-    facilityKey: string | undefined
+    byKey: Map<string, FormData>,
+    orgUnitNames: Map<string, string>,
+    sheetNames: Map<string, string>
 ): void {
-    const sheet = workbook.addWorksheet("_relationships");
-    [20, 14, 16, 16, 42, 34, 24, 52].forEach((width, i) => (sheet.getColumn(i + 1).width = width));
-    const byKey = new Map(all.map(d => [d.form.key, d]));
+    const sheet = workbook.addWorksheet(COLUMN_GUIDE_SHEET, {
+        views: [{ state: "frozen", ySplit: 1 }],
+    });
+    sheet.columns = [24, 40, 24, 30, 90, 14].map(width => ({ width }));
+    sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
+    const header = sheet.addRow([
+        "Sheet",
+        "Column",
+        "Group",
+        "Form section",
+        "What it is / where it comes from",
+        "Rows filled",
+    ]);
+    header.font = { bold: true };
+    header.commit();
 
-    sheet.addRow(["Relationship specification"]).font = { bold: true, size: 14 };
+    for (const data of all) {
+        const columns = sheetColumns(data, byKey, orgUnitNames);
+        const fills = headerFills(columns);
+        columns.forEach((column, i) => {
+            const filled = data.records.filter(r => column.get(r) !== "").length;
+            const row = sheet.addRow([
+                sheetNames.get(data.form.key) ?? data.form.title,
+                column.header,
+                COLUMN_GROUPS[column.group].name,
+                column.section ?? "",
+                column.about,
+                `${filled} of ${data.records.length}`,
+            ]);
+            row.getCell(2).fill = solidFill(fills[i] ?? COLUMN_GROUPS.form.fill);
+            row.commit();
+        });
+    }
+    sheet.commit();
+}
+
+/**
+ * Machine-readable relationship contract: one row per sheet giving its key, the sheet it
+ * belongs to, the column that links them, the other link columns, cardinality and an example
+ * join. Downstream tools (Power BI, SQL loaders) can read this instead of hard-coding it.
+ */
+export function writeJoinsSheet(
+    workbook: Writer,
+    all: FormData[],
+    facilityKey: string | undefined,
+    sheetNames: Map<string, string>
+): void {
+    const sheet = workbook.addWorksheet(JOINS_SHEET);
+    [26, 12, 22, 26, 52, 34, 24, 70].forEach((width, i) => (sheet.getColumn(i + 1).width = width));
+    const byKey = new Map(all.map(d => [d.form.key, d]));
+    const nameOf = (form: ResolvedForm) => sheetNames.get(form.key) ?? form.title;
+
+    sheet.addRow(["How the sheets join"]).font = { bold: true, size: 14 };
     sheet.addRow([
         "Note",
-        "Case report has NO foreign key to Facility: it links to Survey. Facility_id is DERIVED " +
-            "by matching (Survey_id, org_unit_id) against the Facility sheet.",
+        "Case report has NO link to Facility in DHIS2: it links to Survey. Facility record ID is " +
+            "worked out by the extract, by matching the survey and the facility (org unit).",
     ]);
     sheet.addRow([]);
 
     sheet.addRow([
-        "sheet",
-        "primary_key",
-        "parent_sheet",
-        "parent_key",
-        "ancestor_keys",
-        "cardinality",
-        "source_field",
-        "example_join",
+        "Sheet",
+        "Key",
+        "Belongs to",
+        "Linked by (column here)",
+        "All link columns",
+        "Rows per parent",
+        "Stored in DHIS2 field",
+        "Example join",
     ]).font = { bold: true };
 
     for (const { form } of all) {
-        const keyCols = keyColumnsFor(form, byKey);
-        const isSurvey = form.defaultUid === PREVALENCE_SURVEY_FORM_ID;
+        const role = sheetRole(form, byKey);
         const parentForm = form.parentKey ? byKey.get(form.parentKey)?.form : undefined;
+        const links = linkColumnsFor(form, byKey).map(c => c.header);
 
-        let parentKeyCol = "";
+        let linkedBy = "";
         let cardinality = "";
         let exampleJoin = "";
-        let sourceField = form.parentLinkField || "";
-
-        if (form.kind === "dataSet") {
-            parentKeyCol = "(none)";
-            cardinality =
-                "aggregate: 1 row per data element x disaggregation x period x org unit x ward";
+        let sourceField = form.parentLinkField || "-";
+        if (role === "wardStatistics") {
+            linkedBy = "DHIS2 org unit ID, Unique ward ID";
+            cardinality = "one row per statistic x breakdown x period x facility x ward";
             exampleJoin = facilityKey
-                ? `${form.key}.org_unit_id = ${facilityKey}.org_unit_id`
-                : "org_unit_id = <facility org unit>";
-            sourceField = "Ward = the dataValue's attribute option combo";
-        } else if (isSurvey) {
-            parentKeyCol = "(root)";
-            cardinality = "root";
+                ? `'${nameOf(form)}'[DHIS2 org unit ID] = '${
+                      sheetNames.get(facilityKey) ?? facilityKey
+                  }'[DHIS2 org unit ID]`
+                : "-";
+            sourceField = "Ward = the value's attribute option combo";
+        } else if (role === "survey") {
+            linkedBy = "(top level)";
+            cardinality = "-";
             exampleJoin = "-";
             sourceField = "-";
         } else if (parentForm) {
-            const isFacility = form.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID;
-            parentKeyCol =
-                isFacility || parentForm.defaultUid === PREVALENCE_SURVEY_FORM_ID
-                    ? "Survey_id"
-                    : `${parentForm.key}_id`;
-            cardinality = `${parentForm.key} 1 -> N ${form.key}`;
-            exampleJoin = `${form.key}.${parentKeyCol} = ${parentForm.key}.record_id`;
+            linkedBy =
+                parentForm.defaultUid === PREVALENCE_SURVEY_FORM_ID
+                    ? "Survey record ID"
+                    : role === "wards"
+                    ? "Facility record ID"
+                    : `${parentForm.title} record ID`;
+            cardinality = `one ${parentForm.title} -> many ${form.title}`;
+            exampleJoin = `'${nameOf(form)}'[${linkedBy}] = '${nameOf(parentForm)}'[Record ID]`;
         }
 
         sheet.addRow([
-            form.key,
-            "record_id",
-            parentForm?.key ?? (form.kind === "dataSet" ? "(none)" : "(root)"),
-            parentKeyCol,
-            keyCols.map(c => c.header).join(", ") || "-",
+            nameOf(form),
+            "Record ID",
+            parentForm ? nameOf(parentForm) : role === "wardStatistics" ? "(none)" : "(top level)",
+            linkedBy,
+            links.join(", ") || "-",
             cardinality,
-            sourceField || "-",
+            sourceField,
             exampleJoin,
         ]);
     }
 
     sheet.addRow([]);
-    sheet.addRow(["Derived key", "Rule"]).font = { bold: true };
+    sheet.addRow(["Worked-out link", "Rule"]).font = { bold: true };
     sheet.addRow([
-        "Facility_id",
-        facilityKey
-            ? `= ${facilityKey}.record_id WHERE ${facilityKey}.Survey_id = <row>.Survey_id AND ${facilityKey}.org_unit_id = <row>.org_unit_id`
+        "Survey record ID",
+        "Read from each record's own Survey ID field: every record traces to its survey directly.",
+    ]);
+    const facilitySheet = facilityKey && (sheetNames.get(facilityKey) ?? facilityKey);
+    sheet.addRow([
+        "Facility record ID",
+        facilitySheet
+            ? `= '${facilitySheet}'[Record ID] WHERE '${facilitySheet}'[Survey record ID] = row's Survey record ID AND '${facilitySheet}'[DHIS2 org unit ID] = row's DHIS2 org unit ID`
             : "(Facility sheet not extracted)",
     ]);
+    const wardData = facilityWardSheets(all, facilityKey)[0]?.form;
+    const wardSheet = wardData && nameOf(wardData);
     sheet.addRow([
-        "Survey_id",
-        "Read directly from each record's own survey-link attribute — every record traces to its Survey without walking the chain.",
+        "Ward record ID",
+        wardSheet
+            ? `Case report: = '${wardSheet}'[Record ID] WHERE '${wardSheet}'[Facility record ID] = row's Facility record ID AND '${wardSheet}'[Unique ward ID] = row's Unique ward ID (ignoring case, spaces, leading zeros, a trailing slash and Cyrillic look-alike letters). Forms below the case report copy their case report's.`
+            : "(Facility ward data not extracted)",
     ]);
     sheet.commit();
+}
+
+/**
+ * Plain-language guide to the workbook, for the top of the Read me sheet. Only sheets present
+ * are described.
+ */
+export function howTheSheetsLink(
+    all: FormData[],
+    sheetNames: Map<string, string> = new Map()
+): [string, string][] {
+    const nameOf = (form: ResolvedForm) => sheetNames.get(form.key) ?? form.title;
+    const find = (defaultUid: string) => all.find(d => d.form.defaultUid === defaultUid)?.form;
+    const survey = find(PREVALENCE_SURVEY_FORM_ID);
+    const facility = find(PREVALENCE_FACILITY_LEVEL_FORM_ID);
+    const caseReport = find(PREVALENCE_CASE_REPORT_FORM_ID);
+    const wards = facilityWardSheets(all, facility?.key)[0]?.form;
+    const patientForms = caseReport
+        ? all
+              .filter(d => d.form.parentKey === caseReport.key && d.form.kind !== "trackerStage")
+              .map(d => nameOf(d.form))
+        : [];
+    const wardStatistics = all.filter(d => d.form.kind === "dataSet").map(d => nameOf(d.form));
+    const caseSheet = caseReport ? nameOf(caseReport) : "Case report";
+
+    const lines: [string, string][] = [
+        [
+            "Colours",
+            "Headers are coloured by group. Blue: identification (which survey, facility, ward and " +
+                "patient). Orange: data check. Green and yellow: the form's questions, in form order, " +
+                "one shade per form section. Grey: DHIS2 linking and system columns, collapsed; click " +
+                "+ above the columns to show them. Hover over a header to see where its value comes " +
+                "from; the Column guide sheet lists every column.",
+        ],
+        [
+            "Complete",
+            "Every question on the form has a column, even if nobody answered it, and every form " +
+                "has a sheet, even if it has no records.",
+        ],
+        [
+            "Two kinds of ID",
+            "The identification columns hold the IDs the survey teams typed (Survey name, Unique " +
+                "facility ID, Unique ward ID, Unique survey patient ID): use them to read and filter. " +
+                "To join sheets exactly, use the record ID columns (grey group): they are DHIS2's own " +
+                "links and do not depend on typing.",
+        ],
+        [
+            "The IDs nest",
+            "Patient HF025/W16/011 is in ward HF025/W16, in facility HF025. They are unique only " +
+                "within one survey, so filter Survey name first. A ward typed without its facility " +
+                "(W16) is shown in full (HF025/W16). The extract compares IDs ignoring case, spaces, " +
+                "leading zeros, a trailing slash and Cyrillic look-alike letters.",
+        ],
+    ];
+    if (survey) lines.push([nameOf(survey), "One row per survey."]);
+    if (facility) {
+        lines.push([
+            nameOf(facility),
+            "One row per facility taking part in a survey. Linked to its survey by Survey record ID.",
+        ]);
+    }
+    if (wards) {
+        lines.push([
+            nameOf(wards),
+            "One row per ward of a facility. Linked to its facility by Facility record ID.",
+        ]);
+    }
+    if (caseReport) {
+        lines.push([
+            caseSheet,
+            "One row per patient. Linked to its survey by Survey record ID. Facility record ID" +
+                (wards ? " and Ward record ID are" : " is") +
+                " worked out by the extract, as the app stores no such link.",
+        ]);
+    }
+    if (patientForms.length > 0) {
+        lines.push([
+            patientForms.join(", "),
+            `One row per form filled in for a patient. Case report record ID points at the ` +
+                `patient's row on ${caseSheet}. Unique facility ID and Unique ward ID are copied ` +
+                `from that case report; Unique survey patient ID is the one typed on the form itself.`,
+        ]);
+    }
+    if (wardStatistics.length > 0) {
+        lines.push([
+            wardStatistics.join(", "),
+            "Aggregate ward statistics. Linked to a facility by DHIS2 org unit ID, and to a ward by Unique ward ID.",
+        ]);
+    }
+    lines.push(
+        [
+            "Data check",
+            "Rows with a warning are shaded orange and say why in Data check and Data check " +
+                "details. The warnings are explained under Data checks below.",
+        ],
+        [
+            "In Excel",
+            `To bring a value across, e.g. a case report answer onto a lab row: =XLOOKUP(<Case ` +
+                `report record ID cell>, '${caseSheet}'!<Record ID column>, '${caseSheet}'!<column you want>)`,
+        ],
+        ["Power BI / SQL", `Every join is listed on the ${JOINS_SHEET} sheet.`]
+    );
+    return lines;
 }
 
 export function writeIndexSheet(
@@ -2577,6 +3511,7 @@ export function writeIndexSheet(
     all: FormData[],
     unresolved: { spec: FormSpec; reason: string }[],
     baseUrl: string,
+    sheetNames: Map<string, string>,
     extra?: {
         country?: ResolvedCountry;
         integrity?: IntegrityReport;
@@ -2584,11 +3519,12 @@ export function writeIndexSheet(
         discoveries?: FormDiscovery[];
     }
 ): void {
-    const sheet = workbook.addWorksheet("_index");
+    const sheet = workbook.addWorksheet(READ_ME_SHEET);
     [34, 62, 14, 14, 14, 14, 14, 14, 14, 14, 14].forEach(
         (width, i) => (sheet.getColumn(i + 1).width = width)
     );
     const byKey = new Map(all.map(d => [d.form.key, d]));
+    const titleOf = (key: string) => sheetNames.get(key) ?? titleLookup(all)(key);
     const heading = (cells: (string | number)[]) => (sheet.addRow(cells).font = { bold: true });
 
     sheet.addRow(["AMR Surveys extraction"]).font = { bold: true, size: 14 };
@@ -2601,29 +3537,33 @@ export function writeIndexSheet(
             `${c.name}${c.code ? ` (${c.code})` : ""} uid=${c.id} level=${c.level}`,
         ]);
     }
-    sheet.addRow([
-        "Note",
-        "Read-only extraction. One sheet per form; join on the *_id columns. See _relationships.",
+    sheet.addRow(["Note", "Read-only extraction. One sheet per form."]);
+    sheet.addRow([]);
+    heading(["How to read this workbook"]);
+    const legend = sheet.addRow([
+        "Header colours",
+        ...Object.values(COLUMN_GROUPS).map(g => g.name),
     ]);
-    sheet.addRow([
-        "Flags",
-        "Rows needing a second look are shaded orange and say why in the 'flag' and 'flag_detail' " +
-            "columns (columns A-B of every sheet); filter column A to include or exclude them.",
-    ]);
+    Object.values(COLUMN_GROUPS).forEach(
+        (group, i) => (legend.getCell(i + 2).fill = solidFill(group.fill))
+    );
+    for (const line of howTheSheetsLink(all, sheetNames)) {
+        sheet.addRow(line).getCell(2).alignment = { wrapText: true, vertical: "top" };
+    }
     sheet.addRow([]);
 
     heading([
         "Sheet",
-        "Form name (server)",
-        "UID",
-        "Kind",
-        "Custom",
-        "Parent sheet",
-        "Parent link field",
+        "Form name in DHIS2",
+        "DHIS2 id",
+        "DHIS2 kind",
+        "Custom version",
+        "Belongs to",
+        "Link field in DHIS2",
         "Records",
-        "Flagged",
+        "With a data check",
         "Expected",
-        "Reconciled",
+        "Count check",
     ]);
 
     const expectedByKey = new Map((extra?.reconciliation ?? []).map(r => [r.formKey, r.expected]));
@@ -2631,13 +3571,14 @@ export function writeIndexSheet(
         const expected = expectedByKey.get(form.key);
         const reconciled =
             expected === undefined ? "n/a" : expected === records.length ? "OK" : "MISMATCH";
+        const parent = form.parentKey ? byKey.get(form.parentKey)?.form : undefined;
         sheet.addRow([
-            form.key,
+            sheetNames.get(form.key) ?? form.title,
             form.serverName,
             form.uid,
             form.kind,
             form.isCustom ? "yes" : "no",
-            form.parentKey ?? "(root)",
+            parent ? sheetNames.get(parent.key) ?? parent.title : "(top level)",
             form.parentLinkField || "(none)",
             records.length,
             records.filter(r => r.flags.length > 0).length,
@@ -2647,10 +3588,12 @@ export function writeIndexSheet(
     }
 
     sheet.addRow([]);
-    heading(["Hierarchy (child counts)"]);
+    heading(["Sheets and what they belong to (records)"]);
     const renderTree = (data: FormData, depth: number) => {
         sheet.addRow([
-            `${"    ".repeat(depth)}${depth > 0 ? "└─ " : ""}${data.form.key}`,
+            `${"    ".repeat(depth)}${depth > 0 ? "└─ " : ""}${
+                sheetNames.get(data.form.key) ?? data.form.title
+            }`,
             data.records.length,
         ]);
         for (const child of all.filter(d => d.form.parentKey === data.form.key))
@@ -2669,11 +3612,11 @@ export function writeIndexSheet(
 
     const flagged = summariseFlags(all);
     sheet.addRow([]);
-    heading(["Flagged records", "Flag", "Records"]);
+    heading(["Data checks per sheet", "Data check", "Records"]);
     if (flagged.length === 0) sheet.addRow(["none"]);
     for (const f of flagged) sheet.addRow([f.sheet, f.flag, f.count]);
     sheet.addRow([]);
-    heading(["Flag", "Meaning"]);
+    heading(["Data check", "Meaning"]);
     for (const [flag, meaning] of Object.entries(FLAG_MEANINGS)) sheet.addRow([flag, meaning]);
 
     const integrity = extra?.integrity;
@@ -2689,7 +3632,7 @@ export function writeIndexSheet(
             }
             sheet.addRow([]);
             heading([
-                "Fields no longer on the form",
+                "Questions no longer on the form",
                 "Column (marked [not on current form])",
                 "Values",
             ]);
@@ -2704,21 +3647,35 @@ export function writeIndexSheet(
                     (sheetOrder.get(a.sheet) ?? 0) - (sheetOrder.get(b.sheet) ?? 0) ||
                     a.column.localeCompare(b.column, undefined, { numeric: true })
             );
-            for (const f of rows) sheet.addRow([f.sheet, f.column, f.values]);
+            for (const f of rows) sheet.addRow([titleOf(f.sheet), f.column, f.values]);
         }
 
         const findings: [string, string][] = [];
         for (const o of integrity.otherDataSetValues) {
             findings.push([
-                `other dataSet's values: ${o.formKey}`,
+                `other dataSet's values: ${titleOf(o.formKey)}`,
                 `${o.count} value(s) returned for this dataSet belong to another dataSet's wards (the ward ` +
                     `dataSets share data elements); they are on that dataSet's sheet, not this one`,
             ]);
         }
         for (const u of integrity.unresolvedFacility) {
             findings.push([
-                `no facility: ${u.formKey}`,
+                `no facility: ${titleOf(u.formKey)}`,
                 `${u.count} record(s) had no (Survey_id, org_unit_id) match in the Facility sheet`,
+            ]);
+        }
+        for (const u of integrity.unresolvedWard) {
+            findings.push([
+                `no ward: ${titleOf(u.formKey)}`,
+                `${u.count} record(s) name a ward that is not on their facility's ward list, so they have no Ward_id`,
+            ]);
+        }
+        for (const a of integrity.ambiguousFacilityCodes) {
+            findings.push([
+                "conflicting Hospital IDs",
+                `org unit ${a.orgUnit} has Facility records with Hospital IDs ${a.codes.join(
+                    ", "
+                )}; ` + `its ward statistics rows have no Facility_code or Ward_code`,
             ]);
         }
         for (const a of integrity.ambiguousFacilities.slice(0, 50)) {
@@ -2731,13 +3688,13 @@ export function writeIndexSheet(
         }
         for (const u of integrity.unresolvedStageEvents) {
             findings.push([
-                `SKIPPED events: ${u.formKey}`,
+                `SKIPPED events: ${titleOf(u.formKey)}`,
                 `${u.count} event(s) referenced unresolvable program stage ${u.programStage} — their data was NOT extracted`,
             ]);
         }
         for (const d of integrity.duplicateStageEvents) {
             findings.push([
-                `duplicate stage events: ${d.formKey}`,
+                `duplicate stage events: ${titleOf(d.formKey)}`,
                 `${d.count} extra event(s) on single-entry stage ${d.programStage} — the last event's values overwrote the earlier ones in the shared row`,
             ]);
         }
@@ -2749,7 +3706,7 @@ export function writeIndexSheet(
         }
         for (const h of integrity.unresolvedHeaders) {
             findings.push([
-                `deleted field: ${h.formKey}`,
+                `deleted field: ${titleOf(h.formKey)}`,
                 `${h.kind} ${h.id} holds values but no longer exists in DHIS2 metadata; the header shows its id`,
             ]);
         }
@@ -2871,16 +3828,19 @@ export type FormDiscovery = {
     stages: StageDiscovery[];
 };
 
-/** Column count for a form's own sheet: ancestor keys + fixed columns + meta + value columns. */
+/**
+ * Column count of a sheet before any record is fetched: the sheetColumns of its configured
+ * fields, so the forecast and the written sheet agree (fields no longer on the form that
+ * still hold values can only add to it).
+ */
 export function computeColumnCount(
     form: ResolvedForm,
     byKey: Map<string, FormData>,
-    metaKeyCount: number,
-    valueColumnCount: number
+    meta: ProgramMeta,
+    stage?: ProgramStageMeta
 ): number {
-    return (
-        keyColumnsFor(form, byKey).length + FIXED_NON_META_COLUMNS + metaKeyCount + valueColumnCount
-    );
+    const columns = configuredColumns(meta, form.kind, stage);
+    return sheetColumns({ form, records: [], columns }, byKey).length;
 }
 
 /**
@@ -2958,12 +3918,7 @@ async function discoverForm(
             total: first.total ?? 0,
             minDate: first.instances[0]?.occurredAt,
             maxDate: last.instances[0]?.occurredAt,
-            columns: computeColumnCount(
-                form,
-                byKey,
-                EVENT_META_KEYS.length,
-                [...meta.stageById.values()].reduce((sum, s) => sum + s.dataElementLabels.size, 0)
-            ),
+            columns: computeColumnCount(form, byKey, meta),
             stages: [],
         };
     }
@@ -2991,11 +3946,6 @@ async function discoverForm(
         fetchProgramMeta(api, session, form.uid),
     ]);
 
-    const nonRepeatableDataElementCount = [...meta.stageById.values()]
-        .filter(s => !s.repeatable)
-        .reduce((sum, s) => sum + s.dataElementLabels.size, 0);
-    const mainValueColumns = meta.attributes.size + nonRepeatableDataElementCount;
-
     const repeatableStages = [...meta.stageById.values()]
         .filter(s => s.repeatable)
         .sort((a, b) => a.id.localeCompare(b.id));
@@ -3012,12 +3962,7 @@ async function discoverForm(
             stageName: stage.name,
             parentFormKey: form.key,
             rows: stageRowCounts[idx] ?? 0,
-            columns: computeColumnCount(
-                childForm,
-                byKey,
-                TRACKER_STAGE_CHILD_META_KEYS.length,
-                stage.dataElementLabels.size
-            ),
+            columns: computeColumnCount(childForm, byKey, meta, stage),
         };
     });
 
@@ -3026,7 +3971,7 @@ async function discoverForm(
         total: first.total ?? 0,
         minDate: first.instances[0]?.createdAt,
         maxDate: last.instances[0]?.createdAt,
-        columns: computeColumnCount(form, byKey, TRACKER_MAIN_META_KEYS.length, mainValueColumns),
+        columns: computeColumnCount(form, byKey, meta),
         stages,
     };
 }
@@ -3067,19 +4012,21 @@ export type SheetForecast = {
     /** Exact: probed server-side. */
     rows?: number;
     /**
-     * UPPER BOUND, not a prediction. Counts every field CONFIGURED on the form, but a
-     * sheet only gets a column for a field at least one record actually fills in — most
-     * configured fields are typically empty. Measured on KGZ: a stage configured with 222
-     * fields produced 23 real columns, and the whole workbook came out ~12 MB against a
-     * 63-190 MB bound. Treat the size estimate as "definitely no bigger than".
+     * The sheet's columns: every field configured on the form gets one, answered or not (a
+     * field no longer on the form that still holds values adds one more).
      */
     columns?: number;
+    /**
+     * rows x columns: an UPPER BOUND on the cells written, as an empty value writes no cell
+     * and most configured fields are empty. Measured on KGZ: a stage with 222 configured
+     * fields had values in 23, and the workbook came out ~12 MB against a 63-190 MB bound.
+     */
     cells?: number;
 };
 
 export type WorkbookForecast = {
     sheets: SheetForecast[];
-    /** UPPER BOUND, not a prediction — see the note on `columns` in SheetForecast. */
+    /** UPPER BOUND, not a prediction — see the note on `cells` in SheetForecast. */
     totalCells: number;
     /** Upper-bound compressed .xlsx size range, derived from totalCells. */
     estimatedSizeBytesRange: [number, number];
@@ -3101,14 +4048,28 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
+ * The programs a run extracts: every program not proven empty and, for a form whose programs
+ * are all proven empty, its default program, so that every form still gets its (empty)
+ * sheet. Never narrows on anything but a proven zero.
+ */
+export function programsToExtract(
+    forms: ResolvedForm[],
+    totalByUid: Map<string, number | undefined>
+): ResolvedForm[] {
+    const hasData = (form: ResolvedForm) => totalByUid.get(form.uid) !== 0;
+    const formsWithData = new Set(forms.filter(hasData).map(form => form.key));
+    return forms.filter(
+        form => hasData(form) || (!formsWithData.has(form.key) && form.uid === form.defaultUid)
+    );
+}
+
+/**
  * Turns discovery results into a per-sheet row/column/cell forecast, a total workbook
  * size estimate, and warnings for unusually large sheets — everything needed to describe
  * the workbook BEFORE extraction runs (instruction #4).
  *
- * Mirrors extract()'s own skip rule exactly (`total !== 0`, i.e. only a PROVEN-empty form
- * is skipped) so this never predicts a sheet a real run wouldn't produce, or vice versa —
- * that equivalence is what makes "discovery accurately predicts the export" true rather
- * than aspirational.
+ * Uses extraction's own rule (programsToExtract), so it never predicts a sheet a real run
+ * wouldn't produce, or vice versa.
  */
 export function forecastWorkbook(discoveries: FormDiscovery[]): WorkbookForecast {
     const sheets: SheetForecast[] = [];
@@ -3130,7 +4091,13 @@ export function forecastWorkbook(discoveries: FormDiscovery[]): WorkbookForecast
         }
     };
 
-    for (const d of discoveries.filter(d => d.total !== 0)) {
+    const extracted = new Set(
+        programsToExtract(
+            discoveries.map(d => d.form),
+            new Map(discoveries.map(d => [d.form.uid, d.total]))
+        ).map(form => form.uid)
+    );
+    for (const d of discoveries.filter(d => extracted.has(d.form.uid))) {
         addSheet({
             sheetKey: d.form.key,
             rows: d.total,
@@ -3138,9 +4105,8 @@ export function forecastWorkbook(discoveries: FormDiscovery[]): WorkbookForecast
             cells:
                 d.total !== undefined && d.columns !== undefined ? d.total * d.columns : undefined,
         });
-        // A stage with a proven-zero row count produces no sheet at extraction time
-        // either (fetchTracker only creates one once at least one event exists).
-        for (const s of d.stages.filter(s => s.rows !== 0)) {
+        // Every repeatable stage gets its sheet, with or without rows (see fetchTracker).
+        for (const s of d.stages) {
             addSheet({
                 sheetKey: s.sheetKey,
                 parentFormKey: s.parentFormKey,
@@ -3264,12 +4230,12 @@ export function reportDiscovery(
     const formSheets = new Set(forecast.sheets.map(s => s.sheetKey)).size;
     console.log(
         `  worksheets    : ${
-            2 + formSheets
-        }  (_index, _relationships + ${formSheets} form sheet(s))`
+            3 + formSheets
+        }  (${READ_ME_SHEET}, ${COLUMN_GUIDE_SHEET}, ${JOINS_SHEET} + ${formSheets} form sheet(s))`
     );
     console.log(`  rows          : exact (probed)`);
-    console.log(`  columns/cells : UPPER BOUND — every configured field is counted, but a sheet`);
-    console.log(`                  only gets a column for a field some record actually fills in.`);
+    console.log(`  columns       : every configured field, answered or not`);
+    console.log(`  cells         : UPPER BOUND — empty values write no cell, and most are empty.`);
     console.log(`  max cells     : ~${forecast.totalCells.toLocaleString()}`);
     console.log(
         `  max size      : ${formatBytes(forecast.estimatedSizeBytesRange[0])} – ${formatBytes(
@@ -3432,13 +4398,13 @@ async function extractScope(
 
     // Only skip programs proven to have exactly zero records — never narrow on anything else.
     const totalByUid = new Map(discoveries.map(d => [d.form.uid, d.total]));
-    const toExtract = resolved.filter(f => totalByUid.get(f.uid) !== 0);
-    const skipped = resolved.filter(f => totalByUid.get(f.uid) === 0);
+    const toExtract = programsToExtract(resolved, totalByUid);
+    const skipped = resolved.filter(f => !toExtract.includes(f));
     if (skipped.length > 0) {
         console.log(
             `\nSkipping ${skipped.length} program(s) with 0 records: ${skipped
                 .map(programLabel)
-                .join(", ")}`
+                .join(", ")} (every form still gets its sheet)`
         );
     }
 
@@ -3500,7 +4466,9 @@ async function extractScope(
     // --- Integrity ------------------------------------------------------------
     const facilityForm = resolved.find(f => f.defaultUid === PREVALENCE_FACILITY_LEVEL_FORM_ID);
     if (facilityForm) resolveFacilityIds(all, facilityForm.key, integrity);
+    resolveReadableCodes(all, recordIndex, facilityForm?.key, integrity);
     await flagRecords(all, recordIndex, ids => lookUpReferences(api, session, ids));
+    flagIdMismatches(all, recordIndex, facilityForm?.key);
 
     // Reconciliation: what discovery said exists vs what we actually pulled. This is what
     // proves the skip/scope optimisation above never silently dropped data.
@@ -3515,8 +4483,9 @@ async function extractScope(
     );
     if (mismatches.length > 0) {
         console.warn("\n  ! RECONCILIATION MISMATCH — extracted count != discovered count:");
+        const titleOf = titleLookup(all);
         for (const m of mismatches) {
-            console.warn(`      ${m.formKey}: expected ${m.expected}, got ${m.actual}`);
+            console.warn(`      ${titleOf(m.formKey)}: expected ${m.expected}, got ${m.actual}`);
         }
     } else if (discoveries.length > 0) {
         console.log("\nReconciliation: all forms match their discovered counts.");
@@ -3559,24 +4528,25 @@ async function extractScope(
 
     // Collision-safe, deterministic Excel tab names for every sheet, computed once up
     // front so a truncation/sanitization collision can never silently overwrite another
-    // sheet. "_index" and "_relationships" are reserved so a (bizarre) form name can
-    // never collide with them either.
+    // sheet. The workbook's own sheets are reserved so a form title can never take them.
     const sheetNames = assignSheetNames(
-        all.map(d => ({ key: d.form.key, stableId: d.form.uid })),
-        ["_index", "_relationships"],
+        all.map(d => ({ key: d.form.key, name: d.form.title, stableId: d.form.uid })),
+        [READ_ME_SHEET, COLUMN_GUIDE_SHEET, JOINS_SHEET],
         integrity
     );
 
-    writeIndexSheet(workbook, all, unresolved, baseUrl, {
+    writeIndexSheet(workbook, all, unresolved, baseUrl, sheetNames, {
         country,
         integrity,
         reconciliation,
         discoveries,
     });
-    writeRelationshipsSheet(workbook, all, facilityForm?.key);
+    writeColumnGuideSheet(workbook, all, byKey, orgUnitNames, sheetNames);
+    writeJoinsSheet(workbook, all, facilityForm?.key, sheetNames);
     for (const data of all) {
-        const name = sheetNames.get(data.form.key) ?? data.form.key.slice(0, EXCEL_SHEET_NAME_MAX);
-        writeFormSheet(workbook, data, byKey, recordIndex, orgUnitNames, name);
+        const name =
+            sheetNames.get(data.form.key) ?? data.form.title.slice(0, EXCEL_SHEET_NAME_MAX);
+        writeFormSheet(workbook, data, byKey, orgUnitNames, name);
     }
     await workbook.commit();
     fs.renameSync(partialPath, outPath);
